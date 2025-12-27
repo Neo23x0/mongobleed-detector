@@ -28,6 +28,7 @@ METADATA_RATE_THRESHOLD=0.10
 # Runtime state
 ADDITIONAL_PATHS=()
 SKIP_DEFAULT_PATHS=false
+FORENSIC_DIR=""
 
 # Colors for terminal output (disabled if not a TTY)
 if [[ -t 1 ]]; then
@@ -70,6 +71,7 @@ ${BOLD}OPTIONS${RESET}
     -b, --burst-threshold   Burst rate threshold per minute (default: ${BURST_RATE_THRESHOLD})
     -m, --metadata-rate     Metadata rate threshold 0.0-1.0 (default: ${METADATA_RATE_THRESHOLD})
     --no-default-paths      Skip default log paths
+    --forensic-dir <path>   Analyze subdirectories as separate hosts (forensic mode)
     -h, --help              Show this help message
     -v, --version           Show version
 
@@ -97,6 +99,9 @@ ${BOLD}EXAMPLES${RESET}
 
     # Analyze a forensic copy
     ${SCRIPT_NAME} --no-default-paths -p /forensics/mongodb/*.log*
+
+    # Analyze collected evidence from multiple hosts (forensic mode)
+    ${SCRIPT_NAME} --forensic-dir /evidence/
 
 ${BOLD}EXIT CODES${RESET}
     0 - No HIGH or MEDIUM findings
@@ -202,6 +207,19 @@ parse_args() {
             --no-default-paths)
                 SKIP_DEFAULT_PATHS=true
                 shift
+                ;;
+            --forensic-dir)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option $1 requires a directory path"
+                    exit 2
+                fi
+                if [[ ! -d "$2" ]]; then
+                    error "Forensic directory not found: $2"
+                    exit 2
+                fi
+                FORENSIC_DIR="$2"
+                SKIP_DEFAULT_PATHS=true
+                shift 2
                 ;;
             -h|--help)
                 usage
@@ -659,6 +677,169 @@ display_results() {
     return 0
 }
 
+# Analyze forensic directory with hostname subfolders
+analyze_forensic_dir() {
+    local forensic_dir="$1"
+    local cutoff_epoch="$2"
+    local all_results=""
+    local host_count=0
+    
+    # Iterate over subdirectories
+    for host_dir in "$forensic_dir"/*/; do
+        [[ -d "$host_dir" ]] || continue
+        
+        local hostname
+        hostname=$(basename "$host_dir")
+        
+        # Collect log files in this host's directory
+        local log_files=()
+        while IFS= read -r -d '' file; do
+            if [[ -f "$file" && -r "$file" ]]; then
+                log_files+=("$file")
+            fi
+        done < <(find "$host_dir" -maxdepth 1 -type f \( -name "*.log" -o -name "*.log.*" -o -name "*.log*.gz" \) -print0 2>/dev/null)
+        
+        if [[ ${#log_files[@]} -eq 0 ]]; then
+            warn "No log files found in $host_dir"
+            continue
+        fi
+        
+        ((host_count++)) || true
+        info "Analyzing $hostname (${#log_files[@]} file(s))..."
+        
+        # Run analysis for this host
+        local host_results
+        host_results=$(analyze_logs "$cutoff_epoch" "${log_files[@]}")
+        
+        # Prefix each result line with hostname
+        if [[ -n "$host_results" ]]; then
+            while IFS= read -r line; do
+                all_results+="${hostname}|${line}"$'\n'
+            done <<< "$host_results"
+        fi
+    done
+    
+    if [[ $host_count -eq 0 ]]; then
+        error "No host subdirectories found in $forensic_dir"
+        exit 2
+    fi
+    
+    info "Analyzed $host_count host(s)"
+    
+    # Sort combined results: by risk order, then hostname, then conn count
+    if [[ -n "$all_results" ]]; then
+        echo "$all_results" | awk -F'|' '{
+            risk = $2
+            if (risk == "HIGH") order = 1
+            else if (risk == "MEDIUM") order = 2
+            else if (risk == "LOW") order = 3
+            else order = 4
+            print order "|" $0
+        }' | sort -t'|' -k1,1n -k2,2 -k5,5nr | cut -d'|' -f2-
+    fi
+}
+
+# Display results with hostname column (forensic mode)
+display_forensic_results() {
+    local results="$1"
+    
+    if [[ -z "$results" ]]; then
+        echo
+        info "No connection events found in the specified time window."
+        echo
+        return 0
+    fi
+    
+    # Count findings by risk level
+    local high_count=0
+    local medium_count=0
+    local low_count=0
+    local info_count=0
+    
+    while IFS='|' read -r hostname risk ip cc mc dc mr br first last; do
+        case "$risk" in
+            HIGH) ((high_count++)) || true ;;
+            MEDIUM) ((medium_count++)) || true ;;
+            LOW) ((low_count++)) || true ;;
+            INFO) ((info_count++)) || true ;;
+        esac
+    done <<< "$results"
+    
+    echo
+    echo -e "${BOLD}╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗${RESET}"
+    echo -e "${BOLD}║                              MongoBleed (CVE-2025-14847) Forensic Analysis Results                                                 ║${RESET}"
+    echo -e "${BOLD}╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝${RESET}"
+    echo
+    echo -e "${BOLD}Analysis Parameters:${RESET}"
+    echo "  Time Window:        ${TIME_RANGE_MINUTES} minutes"
+    echo "  Connection Thresh:  ${CONNECTION_THRESHOLD}"
+    echo "  Burst Rate Thresh:  ${BURST_RATE_THRESHOLD}/min"
+    echo "  Metadata Rate:      ${METADATA_RATE_THRESHOLD}"
+    echo
+    
+    # Print table header with hostname column
+    printf "${BOLD}%-20s %-8s %-30s %10s %10s %10s %12s %14s %-20s %-20s${RESET}\n" \
+        "Hostname" "Risk" "SourceIP" "ConnCount" "MetaCount" "DiscCount" "MetaRate%" "BurstRate/m" "FirstSeen" "LastSeen"
+    printf "%-20s %-8s %-30s %10s %10s %10s %12s %14s %-20s %-20s\n" \
+        "--------------------" "--------" "------------------------------" "----------" "----------" "----------" "------------" "--------------" "--------------------" "--------------------"
+    
+    # Print results
+    while IFS='|' read -r hostname risk ip cc mc dc mr br first last; do
+        # Skip empty lines
+        [[ -z "$hostname" || -z "$risk" ]] && continue
+        
+        local color=""
+        case "$risk" in
+            HIGH) color="$RED" ;;
+            MEDIUM) color="$YELLOW" ;;
+            LOW) color="$GREEN" ;;
+            *) color="" ;;
+        esac
+        
+        # Format metadata rate as percentage
+        local mr_pct
+        mr_pct=$(awk -v mr="$mr" 'BEGIN { printf "%.2f", mr * 100 }')
+        
+        # Truncate hostname and IP if too long
+        local disp_hostname="${hostname:0:20}"
+        local disp_ip="${ip:0:30}"
+        
+        printf "%-20s ${color}%-8s${RESET} %-30s %10d %10d %10d %11s%% %14.2f %-20s %-20s\n" \
+            "$disp_hostname" "$risk" "$disp_ip" "$cc" "$mc" "$dc" "$mr_pct" "$br" "$first" "$last"
+    done <<< "$results"
+    
+    echo
+    echo -e "${BOLD}════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════${RESET}"
+    echo -e "${BOLD}Summary:${RESET}"
+    
+    if [[ $high_count -gt 0 ]]; then
+        echo -e "  ${RED}HIGH:${RESET}   $high_count finding(s) - Likely exploitation detected"
+    fi
+    if [[ $medium_count -gt 0 ]]; then
+        echo -e "  ${YELLOW}MEDIUM:${RESET} $medium_count finding(s) - Suspicious activity, investigation recommended"
+    fi
+    if [[ $low_count -gt 0 ]]; then
+        echo -e "  ${GREEN}LOW:${RESET}    $low_count finding(s) - High volume but metadata present"
+    fi
+    if [[ $info_count -gt 0 ]]; then
+        echo -e "  INFO:   $info_count finding(s) - Normal activity"
+    fi
+    
+    if [[ $high_count -gt 0 || $medium_count -gt 0 ]]; then
+        echo
+        echo -e "${BOLD}${RED}⚠ IMPORTANT:${RESET} If exploitation is confirmed, patching alone is insufficient."
+        echo "  - Rotate all credentials that may have been exposed"
+        echo "  - Review accessed data for sensitive information disclosure"
+        echo "  - Check for lateral movement from affected systems"
+        echo "  - Preserve logs for forensic analysis"
+        return 1
+    fi
+    
+    echo
+    echo -e "${GREEN}No HIGH or MEDIUM risk findings detected.${RESET}"
+    return 0
+}
+
 main() {
     check_dependencies
     parse_args "$@"
@@ -668,7 +849,28 @@ main() {
     now_epoch=$(date +%s)
     local cutoff_epoch=$((now_epoch - TIME_RANGE_MINUTES * 60))
     
-    # Collect log files
+    # Format cutoff date (compatible with both GNU and BSD date)
+    local cutoff_date
+    cutoff_date=$(date -u -d "@$cutoff_epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || \
+    cutoff_date=$(date -u -r "$cutoff_epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || \
+    cutoff_date="epoch $cutoff_epoch"
+    
+    # Handle forensic mode
+    if [[ -n "$FORENSIC_DIR" ]]; then
+        info "Forensic mode: analyzing subdirectories in $FORENSIC_DIR"
+        info "Time window: $cutoff_date to now"
+        
+        local results
+        results=$(analyze_forensic_dir "$FORENSIC_DIR" "$cutoff_epoch")
+        
+        if display_forensic_results "$results"; then
+            exit 0
+        else
+            exit 1
+        fi
+    fi
+    
+    # Standard mode: collect log files
     local log_files=()
     while IFS= read -r file; do
         [[ -n "$file" ]] && log_files+=("$file")
@@ -682,11 +884,6 @@ main() {
     fi
     
     info "Analyzing ${#log_files[@]} log file(s)..."
-    # Format cutoff date (compatible with both GNU and BSD date)
-    local cutoff_date
-    cutoff_date=$(date -u -d "@$cutoff_epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || \
-    cutoff_date=$(date -u -r "$cutoff_epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || \
-    cutoff_date="epoch $cutoff_epoch"
     info "Time window: $cutoff_date to now"
     
     # Run analysis

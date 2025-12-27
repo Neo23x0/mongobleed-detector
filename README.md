@@ -12,6 +12,7 @@ A standalone Linux command-line script that analyzes MongoDB JSON logs locally a
 - [Installation](#installation)
 - [Usage](#usage)
 - [Example](#example)
+- [Multi-Host Analysis](#multi-host-analysis)
 - [Risk Classification](#risk-classification)
 - [Testing](#testing)
 - [Disclaimer](#disclaimer)
@@ -36,6 +37,8 @@ This tool helps incident responders detect exploitation attempts by analyzing Mo
 - **IPv4 & IPv6** - Full support for both address formats
 - **Configurable Thresholds** - Customize detection sensitivity
 - **Risk Classification** - HIGH, MEDIUM, LOW, INFO severity levels
+- **Forensic Folder Mode** - Analyze collected evidence from multiple hosts
+- **Remote Execution** - Python wrapper for SSH-based scanning of multiple hosts
 
 ## How It Works
 
@@ -53,14 +56,23 @@ A source IP with hundreds of connections but zero metadata events is almost cert
 
 ## Requirements
 
+### Shell Script (mongobleed-detector.sh)
+
 - Linux or macOS (bash 4+)
 - `jq` - JSON processor
 - `awk` (gawk recommended)
 - `gzip` - For compressed log support
 
+### Python Remote Scanner (mongobleed-remote.py)
+
+- Python 3.8+
+- Native SSH client (`ssh`, `scp` commands)
+- No additional Python packages required
+
 ### Install Dependencies
 
 ```bash
+# Shell script dependencies
 # Debian/Ubuntu
 apt-get install jq gawk gzip
 
@@ -69,6 +81,9 @@ dnf install jq gawk gzip
 
 # macOS
 brew install jq gawk
+
+# Python remote scanner has no additional dependencies
+# Uses native ssh/scp commands
 ```
 
 ## Installation
@@ -100,6 +115,9 @@ chmod +x mongobleed-detector.sh
 # Analyze forensic copy (skip default paths)
 ./mongobleed-detector.sh --no-default-paths -p /forensics/mongodb/*.log*
 
+# Analyze collected evidence from multiple hosts (forensic mode)
+./mongobleed-detector.sh --forensic-dir /evidence/
+
 # Show help
 ./mongobleed-detector.sh --help
 ```
@@ -114,6 +132,7 @@ chmod +x mongobleed-detector.sh
 | `-b, --burst-threshold` | Burst rate threshold per minute | 400 |
 | `-m, --metadata-rate` | Metadata rate threshold (0.0-1.0) | 0.10 |
 | `--no-default-paths` | Skip default log paths | false |
+| `--forensic-dir <path>` | Analyze subdirectories as separate hosts | - |
 | `-h, --help` | Show help message | - |
 | `-v, --version` | Show version | - |
 
@@ -165,6 +184,73 @@ Summary:
 ```
 
 The detector identified **8,172 connections** from `137.137.137.137` with **0% metadata rate** and a burst rate of **490 connections/minute**—a clear exploitation signature.
+
+## Multi-Host Analysis
+
+The tool provides two methods for analyzing logs from multiple MongoDB hosts:
+
+### Forensic Folder Mode
+
+When you have collected log files from multiple hosts into a local directory structure, use `--forensic-dir`:
+
+```
+/evidence/
+├── mongodb-prod-01/
+│   ├── mongod.log
+│   └── mongod.log.1.gz
+├── mongodb-prod-02/
+│   └── mongod.log
+└── mongodb-staging/
+    └── mongod.log
+```
+
+```bash
+./mongobleed-detector.sh --forensic-dir /evidence/
+```
+
+The output includes a `Hostname` column derived from the subdirectory names:
+
+```
+Hostname             Risk     SourceIP         ConnCount  MetaCount  ...
+-------------------- -------- ---------------- ---------- ----------
+mongodb-prod-01      HIGH     137.137.137.137       8172          0  ...
+mongodb-prod-02      INFO     10.0.0.1                 5          5  ...
+mongodb-staging      MEDIUM   192.168.1.50           200          2  ...
+```
+
+### Remote Execution via SSH
+
+For live analysis across multiple hosts, use the Python wrapper:
+
+```bash
+# Scan hosts from a file
+./mongobleed-remote.py --hosts-file hosts.txt --user admin
+
+# Scan specific hosts
+./mongobleed-remote.py --host mongo1.example.com --host mongo2.example.com --user admin
+
+# Use specific SSH key with parallel execution
+./mongobleed-remote.py --hosts-file hosts.txt --user admin --key ~/.ssh/mongodb_key --parallel 10
+
+# Pass additional SSH options (e.g., jump host)
+./mongobleed-remote.py --hosts-file hosts.txt --user admin -o "ProxyJump=bastion.example.com"
+```
+
+The Python wrapper:
+- Uses native `ssh` and `scp` commands (no Python dependencies)
+- Respects `~/.ssh/config` (host aliases, ProxyJump, etc.)
+- Works with ssh-agent automatically
+- Copies and executes the detector script remotely
+- Aggregates results into a combined table with hostname column
+- Supports parallel execution for faster scanning
+
+**hosts.txt format:**
+```
+mongodb-prod-01.example.com
+mongodb-prod-02.example.com
+mongodb-staging.example.com
+# Comments are ignored
+```
 
 ## Risk Classification
 
