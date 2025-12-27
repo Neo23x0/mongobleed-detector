@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 readonly SCRIPT_NAME="$(basename "$0")"
 
 # Default configuration
