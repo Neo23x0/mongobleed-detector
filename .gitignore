@@ -1,0 +1,12 @@
+# Test artifacts
+test/logs/
+
+# OS files
+.DS_Store
+*.swp
+*~
+
+# Editor directories
+.idea/
+.vscode/
+
