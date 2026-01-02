@@ -377,9 +377,23 @@ discover_data_sources() {
         local ftdc_count
         ftdc_count=$(find "$ftdc_dir" -maxdepth 1 -type f -name "metrics.*" 2>/dev/null | wc -l)
         if [[ $ftdc_count -gt 0 ]]; then
-            # Check if we can decode FTDC
+            # Check if we can decode FTDC (need decoder script, python3, and pymongo)
             if [[ -f "$SCRIPT_DIR/ftdc-decode.py" ]] && command -v python3 &>/dev/null; then
-                MODULE_B2_AVAILABLE=true
+                # Test if pymongo/bson is available
+                local python_cmd=""
+                if [[ -f "$SCRIPT_DIR/.venv/bin/python3" ]]; then
+                    python_cmd="$SCRIPT_DIR/.venv/bin/python3"
+                else
+                    python_cmd="python3"
+                fi
+                
+                # Quick test import
+                if "$python_cmd" -c "import bson" 2>/dev/null; then
+                    MODULE_B2_AVAILABLE=true
+                else
+                    # Files exist but pymongo not available - will show error during analysis
+                    MODULE_B2_AVAILABLE=false
+                fi
             else
                 warn "FTDC files found but ftdc-decode.py or python3 not available"
             fi
@@ -766,6 +780,14 @@ analyze_ftdc_files() {
         return
     fi
     
+    # Check if FTDC files exist
+    local ftdc_files
+    ftdc_files=$(find "$ftdc_dir" -maxdepth 1 -type f -name "metrics.*" 2>/dev/null | wc -l)
+    if [[ $ftdc_files -eq 0 ]]; then
+        echo "NO_FILES"
+        return
+    fi
+    
     # Try venv Python first (for pymongo), then system Python
     local python_cmd=""
     if [[ -f "$SCRIPT_DIR/.venv/bin/python3" ]]; then
@@ -777,12 +799,28 @@ analyze_ftdc_files() {
         return
     fi
     
-    # Run the decoder with spike detection
+    # Run the decoder with spike detection, capture both stdout and stderr
     local result
-    result=$("$python_cmd" "$decoder" --dir "$ftdc_dir" --detect-spikes --threshold "$threshold" --quiet 2>/dev/null) || {
+    local stderr_output
+    local temp_stderr
+    temp_stderr=$(mktemp)
+    
+    result=$("$python_cmd" "$decoder" --dir "$ftdc_dir" --detect-spikes --threshold "$threshold" --quiet 2>"$temp_stderr")
+    local decode_exit=$?
+    stderr_output=$(cat "$temp_stderr")
+    rm -f "$temp_stderr"
+    
+    # Check stderr for pymongo error
+    if echo "$stderr_output" | grep -qiE "pymongo|bson.*not available|No module named.*bson|No FTDC decoder available.*Install pymongo"; then
+        echo "NO_PYMONGO"
+        return
+    fi
+    
+    # Check if command failed
+    if [[ $decode_exit -ne 0 ]]; then
         echo "DECODE_ERROR"
         return
-    }
+    fi
     
     if [[ -z "$result" ]] || [[ "$result" == "[]" ]]; then
         echo "NO_DATA"
@@ -816,9 +854,20 @@ display_module_status() {
     if [[ "$MODULE_B2_AVAILABLE" == true ]]; then
         local ftdc_count
         ftdc_count=$(find "$DATA_DIR/ftdc-files" -maxdepth 1 -type f -name "metrics.*" 2>/dev/null | wc -l)
-        echo -e "  ${GREEN}[✓]${RESET} Module B2 (FTDC Spikes): $ftdc_count metrics file(s) found"
+        if [[ $ftdc_count -gt 0 ]]; then
+            echo -e "  ${GREEN}[✓]${RESET} Module B2 (FTDC Spikes): $ftdc_count metrics file(s) found"
+        else
+            echo -e "  ${YELLOW}[−]${RESET} Module B2 (FTDC Spikes): No FTDC files found"
+        fi
     else
-        echo -e "  ${YELLOW}[−]${RESET} Module B2 (FTDC Spikes): No FTDC files or decoder unavailable"
+        # Check if files exist but decoder failed
+        local ftdc_count
+        ftdc_count=$(find "$DATA_DIR/ftdc-files" -maxdepth 1 -type f -name "metrics.*" 2>/dev/null | wc -l)
+        if [[ $ftdc_count -gt 0 ]]; then
+            echo -e "  ${YELLOW}[−]${RESET} Module B2 (FTDC Spikes): $ftdc_count file(s) found but decoder unavailable"
+        else
+            echo -e "  ${YELLOW}[−]${RESET} Module B2 (FTDC Spikes): No FTDC files or decoder unavailable"
+        fi
     fi
     
     echo
@@ -857,7 +906,10 @@ display_combined_results() {
     fi
     
     # Parse B2 results
-    if [[ -n "$b2_results" ]] && [[ "$b2_results" != "NO_"* ]] && [[ "$b2_results" != "DECODE_ERROR" ]]; then
+    local b2_error=""
+    if [[ "$b2_results" == "NO_PYMONGO" ]]; then
+        b2_error="NO_PYMONGO"
+    elif [[ -n "$b2_results" ]] && [[ "$b2_results" != "NO_"* ]] && [[ "$b2_results" != "DECODE_ERROR" ]]; then
         b2_spikes=$(echo "$b2_results" | jq -r '.spike_count // 0' 2>/dev/null) || b2_spikes=0
         if [[ $b2_spikes -gt 0 ]]; then
             b2_spike_windows=$(echo "$b2_results" | jq -r '.spikes[] | "\(.start_ts) - \(.end_ts) (+\(.delta_user) user asserts)"' 2>/dev/null) || true
@@ -987,7 +1039,20 @@ display_combined_results() {
     fi
     
     # Display Module B2 results (FTDC spikes)
-    if [[ -n "$b2_results" ]] && [[ "$b2_results" != "NO_"* ]] && [[ "$b2_results" != "DECODE_ERROR" ]]; then
+    if [[ "$b2_error" == "NO_PYMONGO" ]]; then
+        echo -e "${BOLD}Module B2 - FTDC Spike Detection:${RESET}"
+        echo -e "  ${YELLOW}⚠ pymongo module not available${RESET}"
+        echo "  FTDC files were collected but cannot be decoded without pymongo."
+        echo ""
+        echo -e "  ${BOLD}To enable FTDC analysis, install pymongo:${RESET}"
+        if [[ -f "$SCRIPT_DIR/.venv/bin/python3" ]]; then
+            echo "    $SCRIPT_DIR/.venv/bin/pip install pymongo"
+        else
+            echo "    pip install pymongo"
+            echo "    # Or activate your virtual environment first"
+        fi
+        echo
+    elif [[ -n "$b2_results" ]] && [[ "$b2_results" != "NO_"* ]] && [[ "$b2_results" != "DECODE_ERROR" ]]; then
         echo -e "${BOLD}Module B2 - FTDC Spike Detection:${RESET}"
         
         local total_samples time_start time_end
@@ -1360,8 +1425,10 @@ main() {
             b1_results=$(analyze_assert_counts "$DATA_DIR/assert-counts" "$SPIKE_THRESHOLD" "$USER_RATIO_THRESHOLD")
         fi
         
-        # Run Module B2 (FTDC Spikes)
-        if [[ "$MODULE_B2_AVAILABLE" == true ]]; then
+        # Run Module B2 (FTDC Spikes) - try even if decoder unavailable to show proper error
+        local ftdc_count
+        ftdc_count=$(find "$DATA_DIR/ftdc-files" -maxdepth 1 -type f -name "metrics.*" 2>/dev/null | wc -l)
+        if [[ $ftdc_count -gt 0 ]]; then
             info "Module B2: Analyzing FTDC files..."
             b2_results=$(analyze_ftdc_files "$DATA_DIR/ftdc-files" "$SPIKE_THRESHOLD")
         fi
