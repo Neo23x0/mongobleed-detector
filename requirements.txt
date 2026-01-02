@@ -1,0 +1,10 @@
+# MongoBleed Detector - Python Dependencies
+#
+# Required for:
+# - FTDC (Full-Time Diagnostic Data Capture) file decoding
+# - Remote host scanning (mongobleed-remote.py)
+#
+# Install with: pip install -r requirements.txt
+
+pymongo>=4.0.0
+

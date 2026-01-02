@@ -1,0 +1,13 @@
+{
+  "timestamp": "2026-01-02T10:28:12Z",
+  "hostname": "mongo-stable",
+  "asserts": {
+    "regular": 0,
+    "warning": 0,
+    "msg": 0,
+    "user": 1050,
+    "tripwire": 0,
+    "rollovers": 0
+  },
+  "uptime": 89400
+}

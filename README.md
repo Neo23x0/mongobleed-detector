@@ -1,21 +1,23 @@
 # MongoBleed Detector
 
-**Offline MongoDB Log Correlation Tool for CVE-2025-14847 (MongoBleed)**
+**Offline MongoDB Analysis Tool for CVE-2025-14847 (MongoBleed)**
 
-A standalone Linux command-line script that analyzes MongoDB JSON logs locally and identifies likely exploitation of CVE-2025-14847.
+A standalone Linux command-line tool that analyzes MongoDB data to identify likely exploitation of CVE-2025-14847 using multiple detection modules.
 
 ## Table of Contents
 
 - [Overview](#overview)
-- [How It Works](#how-it-works)
+- [Detection Modules](#detection-modules)
 - [Requirements](#requirements)
 - [Installation](#installation)
-- [Usage](#usage)
-- [Example](#example)
-- [Multi-Host Analysis](#multi-host-analysis)
-- [Risk Classification](#risk-classification)
+- [Two Modes of Operation](#two-modes-of-operation)
+- [Mode 1: Local Analysis](#mode-1-local-analysis)
+- [Mode 2: Remote Collection](#mode-2-remote-collection)
+- [Command-Line Options](#command-line-options)
+- [Confidence Levels](#confidence-levels)
+- [Example Output](#example-output)
 - [Testing](#testing)
-- [Disclaimer](#disclaimer)
+- [Caveats & Limitations](#caveats--limitations)
 - [References & Credits](#references--credits)
 - [License](#license)
 
@@ -23,26 +25,26 @@ A standalone Linux command-line script that analyzes MongoDB JSON logs locally a
 
 MongoBleed (CVE-2025-14847) is a memory disclosure vulnerability in MongoDB's zlib decompression that allows attackers to extract sensitive data—credentials, session tokens, PII—directly from server memory without authentication.
 
-This tool helps incident responders detect exploitation attempts by analyzing MongoDB logs for the characteristic attack pattern:
+This tool helps incident responders detect exploitation attempts using multiple evidence sources:
 
-- **High connection volume** from a single source IP
-- **Absence of client metadata** (legitimate clients always send metadata)
-- **Short-duration burst behavior** (100,000+ connections per minute)
+- **Module A**: Log correlation (connection events, metadata absence)
+- **Module B1**: Assert counts analysis (serverStatus.asserts snapshots)
+- **Module B2**: FTDC spike detection (diagnostic.data time series)
 
-### Features
+### Key Features
 
-- **Offline & Agentless** - No network connectivity, no agents, no SIEM required
-- **Streaming Processing** - Handles large log files without loading into memory
-- **Compressed Log Support** - Transparently processes `.gz` rotated logs
-- **IPv4 & IPv6** - Full support for both address formats
-- **Configurable Thresholds** - Customize detection sensitivity
-- **Risk Classification** - HIGH, MEDIUM, LOW, INFO severity levels
-- **Forensic Folder Mode** - Analyze collected evidence from multiple hosts
-- **Remote Execution** - Python wrapper for SSH-based scanning of multiple hosts
+- **Multi-Module Detection** - Correlates multiple data sources for higher confidence
+- **Offline & Agentless** - No network connectivity required during analysis
+- **Auto-Discovery** - Automatically detects available data sources
+- **Remote Collection** - Collects data from multiple hosts via SSH
+- **Combined Scoring** - HIGH/MEDIUM/LOW confidence verdicts
+- **Streaming Processing** - Handles large log files efficiently
 
-## How It Works
+## Detection Modules
 
-The tool correlates three MongoDB log event types:
+### Module A: Log Correlation
+
+Analyzes MongoDB JSON logs to detect exploitation patterns:
 
 | Event ID | Type | Description |
 |----------|------|-------------|
@@ -50,9 +52,15 @@ The tool correlates three MongoDB log event types:
 | 51800 | Client Metadata | Logged when a client sends driver/application info |
 | 22944 | Connection Closed | Logged when a client disconnects |
 
-**Key insight**: Every legitimate MongoDB driver sends client metadata immediately after connecting. The MongoBleed exploit connects, extracts memory, and disconnects—but never sends metadata.
+**Key insight**: Legitimate MongoDB drivers always send client metadata. The MongoBleed exploit connects, extracts memory, and disconnects—but never sends metadata.
 
-A source IP with hundreds of connections but zero metadata events is almost certainly exploitation, not legitimate traffic.
+### Module B1: Assert Counts
+
+Analyzes snapshots of `db.serverStatus().asserts` to detect unusual spikes in `asserts.user` counters. While cumulative counters can produce false positives, comparing multiple snapshots allows detection of exploitation bursts.
+
+### Module B2: FTDC Spike Detection
+
+Analyzes MongoDB's Full-Time Diagnostic Data Capture (FTDC) files to detect time-localized spikes in assertion counters. FTDC samples serverStatus periodically, enabling precise timing of potential attacks.
 
 ## Requirements
 
@@ -63,11 +71,16 @@ A source IP with hundreds of connections but zero metadata events is almost cert
 - `awk` (gawk recommended)
 - `gzip` - For compressed log support
 
-### Python Remote Scanner (mongobleed-remote.py)
+### Python Components (optional, for FTDC decoding)
+
+- Python 3.8+
+- `pymongo` - For FTDC file decoding
+
+### Remote Scanner (mongobleed-remote.py)
 
 - Python 3.8+
 - Native SSH client (`ssh`, `scp` commands)
-- No additional Python packages required
+- No additional Python packages required for basic operation
 
 ### Install Dependencies
 
@@ -82,8 +95,8 @@ dnf install jq gawk gzip
 # macOS
 brew install jq gawk
 
-# Python remote scanner has no additional dependencies
-# Uses native ssh/scp commands
+# Python dependencies (for FTDC decoding)
+pip install -r requirements.txt
 ```
 
 ## Installation
@@ -93,48 +106,167 @@ brew install jq gawk
 git clone https://github.com/your-org/mongobleed-detector.git
 cd mongobleed-detector
 
-# Make executable
+# Make scripts executable
 chmod +x mongobleed-detector.sh
+chmod +x mongobleed-remote.py
+chmod +x ftdc-decode.py
+
+# Install Python dependencies (optional, for FTDC support)
+pip install -r requirements.txt
 ```
 
-## Usage
+## Two Modes of Operation
+
+### Mode 1: Local Analysis
+
+Analyze data that has been manually collected from MongoDB hosts.
+
+### Mode 2: Remote Collection
+
+Automatically collect data from multiple hosts via SSH, then analyze locally.
+
+## Mode 1: Local Analysis
+
+### Step 1: Collect Data
+
+Collect data from your MongoDB hosts and organize it into this structure:
+
+```
+./collected-data/
+├── logs/                    # MongoDB JSON logs
+│   ├── mongod.log
+│   ├── mongod.log.1
+│   └── mongod.log.2.gz
+├── assert-counts/           # serverStatus().asserts snapshots
+│   ├── asserts-2025-01-01.json
+│   └── asserts-2025-01-02.json
+└── ftdc-files/              # FTDC diagnostic.data contents
+    ├── metrics.2025-01-02T10-00-00Z-00000
+    └── metrics.interim
+```
+
+#### Collecting Logs
 
 ```bash
-# Scan default paths (/var/log/mongodb/*.log*)
+# Copy from remote host
+scp user@mongohost:/var/log/mongodb/mongod.log* ./collected-data/logs/
+```
+
+#### Collecting Assert Counts
+
+Run this command on the MongoDB host (requires mongosh access):
+
+```bash
+mongosh --quiet --eval 'JSON.stringify({
+  timestamp: new Date().toISOString(),
+  hostname: db.hostInfo().system.hostname,
+  asserts: db.serverStatus().asserts,
+  uptime: db.serverStatus().uptime
+})' > asserts-$(date +%Y%m%d-%H%M%S).json
+```
+
+Copy the resulting JSON file to `./collected-data/assert-counts/`.
+
+**Tip**: Run this command multiple times (e.g., hourly) to establish a baseline and detect spikes.
+
+#### Collecting FTDC Files
+
+FTDC files are located at:
+- **mongod**: `<storage.dbPath>/diagnostic.data/` (commonly `/var/lib/mongodb/diagnostic.data/`)
+- **mongos**: Derived from `systemLog.path` (e.g., `/var/log/mongodb/mongos.diagnostic.data/`)
+
+```bash
+# Copy FTDC files (may require sudo)
+sudo cp /var/lib/mongodb/diagnostic.data/metrics.* ./collected-data/ftdc-files/
+```
+
+### Step 2: Run Analysis
+
+```bash
+# Auto-discovery mode - analyzes all available data
+./mongobleed-detector.sh --data-dir ./collected-data/
+
+# With custom thresholds
+./mongobleed-detector.sh --data-dir ./collected-data/ \
+    -t 1440 \              # 24-hour lookback
+    -c 50 \                # Lower connection threshold
+    --spike-threshold 50   # Lower spike threshold
+```
+
+### Legacy Mode (Logs Only)
+
+For backward compatibility, you can still analyze logs directly:
+
+```bash
+# Scan default paths
 ./mongobleed-detector.sh
 
 # Scan specific log files
 ./mongobleed-detector.sh -p /path/to/logs/*.json
 
-# Custom time window (7 days)
-./mongobleed-detector.sh -t 10080
-
-# Custom thresholds
-./mongobleed-detector.sh -c 50 -b 300 -m 0.15
-
-# Analyze forensic copy (skip default paths)
-./mongobleed-detector.sh --no-default-paths -p /forensics/mongodb/*.log*
-
-# Analyze collected evidence from multiple hosts (forensic mode)
+# Forensic mode (analyze multiple hosts)
 ./mongobleed-detector.sh --forensic-dir /evidence/
-
-# Show help
-./mongobleed-detector.sh --help
 ```
 
-### Command-Line Options
+## Mode 2: Remote Collection
+
+Automatically collect data from multiple hosts and analyze:
+
+```bash
+# Create hosts file
+cat > hosts.txt << EOF
+mongo-prod-01.example.com
+mongo-prod-02.example.com
+mongo-staging.example.com
+EOF
+
+# Collect and analyze
+./mongobleed-remote.py --hosts-file hosts.txt --user admin --output-dir ./collected-data/
+```
+
+### Remote Scanner Options
+
+```bash
+# Use specific SSH key
+./mongobleed-remote.py --hosts-file hosts.txt --user admin --key ~/.ssh/mongodb_key
+
+# Parallel execution
+./mongobleed-remote.py --hosts-file hosts.txt --user admin --parallel 10
+
+# Skip FTDC collection (faster)
+./mongobleed-remote.py --hosts-file hosts.txt --user admin --skip-ftdc
+
+# Collect only, analyze later
+./mongobleed-remote.py --hosts-file hosts.txt --user admin --collect-only
+
+# Pass SSH options (e.g., jump host)
+./mongobleed-remote.py --hosts-file hosts.txt --user admin \
+    -o "ProxyJump=bastion.example.com"
+```
+
+### What Gets Collected
+
+| Data Type | Source | Destination |
+|-----------|--------|-------------|
+| Logs | `/var/log/mongodb/mongod.log*` | `<output-dir>/<hostname>/logs/` |
+| Assert Counts | `mongosh` command | `<output-dir>/<hostname>/assert-counts/` |
+| FTDC Files | `/var/lib/mongodb/diagnostic.data/metrics.*` | `<output-dir>/<hostname>/ftdc-files/` |
+
+## Command-Line Options
+
+### mongobleed-detector.sh
 
 | Option | Description | Default |
 |--------|-------------|---------|
+| `-d, --data-dir <path>` | Directory with collected data (auto-discovery mode) | - |
 | `-p, --path <glob>` | Additional log path/glob (repeatable) | - |
 | `-t, --time <minutes>` | Lookback window in minutes | 4320 (3 days) |
 | `-c, --conn-threshold` | Connection count threshold | 100 |
 | `-b, --burst-threshold` | Burst rate threshold per minute | 400 |
 | `-m, --metadata-rate` | Metadata rate threshold (0.0-1.0) | 0.10 |
+| `--spike-threshold` | Assert spike threshold | 100 |
 | `--no-default-paths` | Skip default log paths | false |
 | `--forensic-dir <path>` | Analyze subdirectories as separate hosts | - |
-| `-h, --help` | Show help message | - |
-| `-v, --version` | Show version | - |
 
 ### Exit Codes
 
@@ -142,150 +274,117 @@ chmod +x mongobleed-detector.sh
 |------|---------|
 | 0 | No HIGH or MEDIUM findings |
 | 1 | HIGH or MEDIUM findings detected |
-| 2 | Error (missing dependencies, no logs, etc.) |
+| 2 | Error (missing dependencies, no data, etc.) |
 
-## Example
+## Confidence Levels
 
-Running the detector against a log containing exploitation attempts:
+The tool provides a combined confidence verdict based on all available evidence:
 
-```bash
-$ ./mongobleed-detector.sh --no-default-paths -p example-logs/mongod.log
+| Confidence | Criteria | Interpretation |
+|------------|----------|----------------|
+| **HIGH** | FTDC peaks detected AND suspicious logs in same time window | Strong indicator of exploitation |
+| **MEDIUM** | FTDC peaks OR suspicious logs (not correlated) | Investigation recommended |
+| **LOW** | Only cumulative assert counts without spikes | Anomaly detected, weak evidence |
+| **INFO** | No significant findings | Normal activity |
+
+### Module-Specific Risk Levels
+
+For log correlation (Module A), individual IPs are classified:
+
+| Risk | Criteria |
+|------|----------|
+| **HIGH** | Connections ≥ threshold, metadata rate < 10%, burst rate ≥ 400/min |
+| **MEDIUM** | Connections ≥ threshold, metadata rate < 10%, burst rate < 400/min |
+| **LOW** | Connections ≥ threshold, metadata rate ≥ 10% |
+| **INFO** | Connections < threshold |
+
+## Example Output
+
 ```
-
-**Output:**
-
-```
-INFO: Analyzing 1 log file(s)...
-INFO: Time window: 2025-12-24T13:22:17Z to now
+INFO: Auto-discovery mode: analyzing ./collected-data/
+INFO: Module A: Analyzing 3 log file(s)...
+INFO: Module B1: Analyzing assert-counts...
 
 ╔══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗
 ║                              MongoBleed (CVE-2025-14847) Detection Results                                       ║
 ╚══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+Module Status:
+  [✓] Module A (Log Correlation): 3 log file(s) found
+  [✓] Module B1 (Assert Counts): 4 snapshot(s) found
+  [−] Module B2 (FTDC Spikes): No FTDC files or decoder unavailable
 
 Analysis Parameters:
   Time Window:        4320 minutes
   Connection Thresh:  100
   Burst Rate Thresh:  400/min
   Metadata Rate:      0.10
+  Spike Threshold:    100
+
+Module A - Log Correlation Findings:
 
 Risk     SourceIP                                  ConnCount  MetaCount  DiscCount    MetaRate%    BurstRate/m FirstSeen (UTC)        LastSeen (UTC)        
 -------- ---------------------------------------- ---------- ---------- ---------- ------------ -------------- ---------------------- ----------------------
 HIGH     137.137.137.137                                8172          0       8172        0.00%         490.32 2025-12-27T12:55:52Z   2025-12-27T13:12:32Z  
 
+Module B1 - Assert Counts Analysis:
+  Analyzed 4 snapshots from 2025-01-01T10:00:00Z to 2025-01-01T11:30:00Z
+    asserts.user: 100 -> 860 (delta: 760)
+  SPIKE DETECTED: 2025-01-01T10:30:00Z to 2025-01-01T11:00:00Z
+    Delta: +740 user asserts (110 -> 850)
+
 ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════
-Summary:
-  HIGH:   1 source(s) - Likely exploitation detected
+Combined Verdict:
+  MEDIUM CONFIDENCE - Investigation recommended
+    - Suspicious connection patterns but FTDC data unavailable for correlation
 
 ⚠ IMPORTANT: If exploitation is confirmed, patching alone is insufficient.
   - Rotate all credentials that may have been exposed
   - Review accessed data for sensitive information disclosure
   - Check for lateral movement from affected systems
   - Preserve logs for forensic analysis
+
+Caveats:
+  - Connection metadata absence is PoC-specific and can be evaded
+  - Assertion counters are cumulative - false positives possible without baseline
+  - FTDC provides timing but not perfect attribution
+  - Patch + rotate secrets remains mandatory regardless of detection results
 ```
-
-The detector identified **8,172 connections** from `137.137.137.137` with **0% metadata rate** and a burst rate of **490 connections/minute**—a clear exploitation signature.
-
-## Multi-Host Analysis
-
-The tool provides two methods for analyzing logs from multiple MongoDB hosts:
-
-### Forensic Folder Mode
-
-When you have collected log files from multiple hosts into a local directory structure, use `--forensic-dir`:
-
-```
-/evidence/
-├── mongodb-prod-01/
-│   ├── mongod.log
-│   └── mongod.log.1.gz
-├── mongodb-prod-02/
-│   └── mongod.log
-└── mongodb-staging/
-    └── mongod.log
-```
-
-```bash
-./mongobleed-detector.sh --forensic-dir /evidence/
-```
-
-The output includes a `Hostname` column derived from the subdirectory names:
-
-```
-Hostname             Risk     SourceIP         ConnCount  MetaCount  ...
--------------------- -------- ---------------- ---------- ----------
-mongodb-prod-01      HIGH     137.137.137.137       8172          0  ...
-mongodb-prod-02      INFO     10.0.0.1                 5          5  ...
-mongodb-staging      MEDIUM   192.168.1.50           200          2  ...
-```
-
-### Remote Execution via SSH
-
-For live analysis across multiple hosts, use the Python wrapper:
-
-```bash
-# Scan hosts from a file
-./mongobleed-remote.py --hosts-file hosts.txt --user admin
-
-# Scan specific hosts
-./mongobleed-remote.py --host mongo1.example.com --host mongo2.example.com --user admin
-
-# Use specific SSH key with parallel execution
-./mongobleed-remote.py --hosts-file hosts.txt --user admin --key ~/.ssh/mongodb_key --parallel 10
-
-# Pass additional SSH options (e.g., jump host)
-./mongobleed-remote.py --hosts-file hosts.txt --user admin -o "ProxyJump=bastion.example.com"
-```
-
-The Python wrapper:
-- Uses native `ssh` and `scp` commands (no Python dependencies)
-- Respects `~/.ssh/config` (host aliases, ProxyJump, etc.)
-- Works with ssh-agent automatically
-- Copies and executes the detector script remotely
-- Aggregates results into a combined table with hostname column
-- Supports parallel execution for faster scanning
-
-**hosts.txt format:**
-```
-mongodb-prod-01.example.com
-mongodb-prod-02.example.com
-mongodb-staging.example.com
-# Comments are ignored
-```
-
-## Risk Classification
-
-| Risk | Criteria | Interpretation |
-|------|----------|----------------|
-| **HIGH** | Connections ≥ threshold, metadata rate < 10%, burst rate ≥ 400/min | Likely active exploitation |
-| **MEDIUM** | Connections ≥ threshold, metadata rate < 10%, burst rate < 400/min | Suspicious, investigate further |
-| **LOW** | Connections ≥ threshold, metadata rate ≥ 10% | High volume but likely legitimate |
-| **INFO** | Connections < threshold | Normal activity |
-
-### Interpreting Results
-
-- **HIGH** - Strong indicator of MongoBleed exploitation. Immediate investigation required.
-- **MEDIUM** - Suspicious pattern with missing metadata. Could be misconfigured client or slower exploitation attempt.
-- **LOW** - High connection volume but client metadata is present. Likely legitimate but unusual traffic.
-- **INFO** - Normal activity below detection thresholds.
 
 ## Testing
 
 The repository includes a test suite to validate the detector.
 
-### Generate Test Logs
+### Real-World Example Data
+
+The `example-data/` directory contains real data from a MongoDB 8.0.16 instance that was attacked using the MongoBleed PoC:
+
+```
+example-data/
+├── logs/                    # Real MongoDB logs with attack patterns
+│   ├── mongod.log
+│   └── mongod.log.1.gz
+├── assert-counts/           # Post-attack serverStatus().asserts snapshot
+│   └── asserts-post-attack.json
+└── ftdc-files/              # Real FTDC diagnostic data files
+    └── metrics.*
+```
+
+This data shows:
+- **16,344 connections** from attacker IP 137.137.137.137 with 0% metadata
+- **37,384 user asserts** accumulated during the attack
+- **FTDC files** spanning the attack window
+
+### Generate Synthetic Test Data
 
 ```bash
 ./test/generate-test-logs.sh
 ```
 
-This creates synthetic logs with various patterns:
-- `exploit_high.log` - HIGH risk exploitation pattern
-- `suspicious_medium.log` - MEDIUM risk pattern
-- `highvolume_low.log` - LOW risk (high volume, metadata present)
-- `normal_info.log` - INFO risk (normal traffic)
-- `ipv6_test.log` - IPv6 address handling
-- `malformed_mixed.log` - Malformed line tolerance
-- `compressed.log.gz` - Compressed log support
+This creates additional synthetic test data with various patterns:
+- Log files with HIGH/MEDIUM/LOW/INFO risk patterns
+- Assert-counts JSON snapshots (with and without spikes)
+- Edge cases (IPv6, malformed input, etc.)
 
 ### Run Tests
 
@@ -300,67 +399,75 @@ This creates synthetic logs with various patterns:
 ║       MongoBleed Detector Test Suite                   ║
 ╚════════════════════════════════════════════════════════╝
 
-→ Testing: Example log exploitation detection
+Module A Tests (Log Correlation):
 ✓ PASS: Exit code is 1 (findings detected)
 ✓ PASS: Detected source IP 137.137.137.137
-✓ PASS: Classified as HIGH or MEDIUM risk
-✓ PASS: Detected 0% metadata rate
-✓ PASS: Shows post-exploitation warning
+...
 
-→ Testing: Generated HIGH risk pattern
-✓ PASS: Classified 10.0.0.99 as HIGH risk
+Module B1 Tests (Assert Counts):
+✓ PASS: Shows Module B1 status
+✓ PASS: Detected assert spike
+...
 
-... (16 tests total)
+Auto-Discovery Mode Tests:
+✓ PASS: Shows Module A status
+✓ PASS: Shows combined verdict
+...
 
 Results:
-  Passed: 16
+  Passed: 24
   Failed: 0
 
 All tests passed!
 ```
 
-## Disclaimer
+## Caveats & Limitations
 
-> **⚠️ LIMITED TESTING NOTICE**
->
-> This tool has been validated against:
-> - A nearly empty MongoDB log (startup events only)
-> - A log containing confirmed MongoBleed exploitation artifacts
-> - Synthetic test data with various attack patterns
->
-> **It has NOT been extensively tested against high-volume production MongoDB logs.**
->
-> We encourage users to:
-> 1. Test this tool against your production logs before relying on it for incident response
-> 2. Report false positives or false negatives via GitHub issues
-> 3. Share anonymized statistics about legitimate traffic patterns to help improve thresholds
->
-> The default thresholds are based on the documented exploit behavior (100,000+ connections/minute with 0% metadata), but your environment may differ.
+> **⚠️ Important Limitations**
 
-### Known Limitations
+### Detection Limitations
 
-- **JSON logging required** - MongoDB 4.4+ defaults to JSON logs. Legacy text logs are not supported.
-- **Log retention matters** - Can only analyze logs that exist. Aggressive rotation or attacker log clearing will destroy evidence.
-- **Evasion possible** - A motivated attacker could modify the exploit to send fake metadata, though this would reduce exploitation speed.
+1. **PoC-Specific Detection**: The metadata absence detection is based on the known MongoBleed PoC behavior. A sophisticated attacker could modify the exploit to send fake metadata, though this would reduce exploitation speed.
+
+2. **Cumulative Counters**: `asserts.user` is cumulative since mongod restart. Without baseline snapshots, high values may be normal for long-running instances. Multiple snapshots over time significantly improve accuracy.
+
+3. **FTDC Timing**: FTDC provides timing information but not perfect attribution. Use in conjunction with log correlation for best results.
+
+4. **Log Retention**: Can only analyze logs that exist. Aggressive rotation or attacker log clearing will destroy evidence.
+
+### Technical Requirements
+
+1. **JSON Logging Required**: MongoDB 4.4+ defaults to JSON logs. Legacy text logs are not supported.
+
+2. **FTDC Decoder**: FTDC decoding requires Python 3 with pymongo. Without it, Module B2 is unavailable.
+
+3. **mongosh Access**: Collecting assert counts requires mongosh with appropriate permissions.
+
+### Post-Detection Actions
+
+If HIGH or MEDIUM findings are confirmed:
+
+1. **Preserve Evidence** - Copy logs before they rotate
+2. **Credential Rotation** - Rotate all MongoDB credentials and any secrets that may have been in memory
+3. **Data Review** - Assess what sensitive data may have been exposed
+4. **Lateral Movement** - Check for attacker movement to other systems
+5. **Patch Immediately** - Apply MongoDB security updates
+6. **Report** - Follow your incident response procedures
 
 ## References & Credits
 
 ### Detection Research
 
-The detection logic in this tool is based on the excellent research by **Eric Capuano**, who analyzed the MongoBleed exploitation artifacts and identified the key behavioral signature: rapid connections without client metadata.
+The detection logic in this tool is based on research by **Eric Capuano** and **Tamir Zimerman**:
 
-📖 **[Hunting MongoBleed (CVE-2025-14847)](https://blog.ecapuano.com/p/hunting-mongobleed-cve-2025-14847)** - Eric's detailed writeup on the vulnerability, attack pattern, and detection methodology.
+- [Hunting MongoBleed (CVE-2025-14847)](https://blog.ecapuano.com/p/hunting-mongobleed-cve-2025-14847) - Eric Capuano's writeup on the vulnerability and detection methodology
+- [A Different MongoBleed Perspective](https://medium.com/@ant1d0t3/a-different-mongobleed-perspective-5f08b4bf887a) - Tamir Zimerman's analysis of assertion-based detection
 
-> "Every legitimate MongoDB driver—whether it's PyMongo, the Node.js driver, mongosh, or any other—sends a 'client metadata' message immediately after connecting. The MongoBleed exploit? It connects, does its thing, and disconnects. No metadata. Ever."
->
-> — Eric Capuano
+### MongoDB Documentation
 
-### Additional Resources
-
-- [CVE-2025-14847 (MITRE)](https://cve.mitre.org/)
-- [Kevin Beaumont's MongoBleed Writeup](https://doublepulsar.com/)
-- [mongobleed POC by Joe Desimone](https://github.com/)
-- [Ox Security Technical Analysis](https://ox.security/)
+- [serverStatus Command](https://www.mongodb.com/docs/v7.0/reference/command/serverstatus/) - asserts field documentation
+- [Full Time Diagnostic Data Capture](https://www.mongodb.com/docs/manual/administration/full-time-diagnostic-data-capture/) - FTDC storage locations
+- [What is MongoDB FTDC](https://www.alexbevi.com/blog/2020/01/26/what-is-mongodb-ftdc-aka-diagnostic-dot-data/) - FTDC format background
 
 ### Affected Versions
 
@@ -376,17 +483,6 @@ The detection logic in this tool is based on the excellent research by **Eric Ca
 | 4.0.x | 4.0.0+ | No fix |
 | 3.6.x | 3.6.0+ | No fix |
 
-## Post-Detection Actions
-
-If HIGH or MEDIUM findings are confirmed:
-
-1. **Preserve Evidence** - Copy logs before they rotate
-2. **Credential Rotation** - Rotate all MongoDB credentials and any secrets that may have been in memory
-3. **Data Review** - Assess what sensitive data may have been exposed
-4. **Lateral Movement** - Check for attacker movement to other systems
-5. **Patch Immediately** - Apply MongoDB security updates
-6. **Report** - Follow your incident response procedures
-
 ## License
 
 See [LICENSE](LICENSE) file.
@@ -395,7 +491,8 @@ See [LICENSE](LICENSE) file.
 
 Contributions welcome! Please submit issues and pull requests.
 
-If you test this tool against production logs, we'd especially appreciate feedback on:
+If you test this tool against production data, we'd especially appreciate feedback on:
 - False positive rates
-- Legitimate traffic patterns (connections/min, metadata rates)
-- Any edge cases or parsing failures
+- Legitimate traffic patterns
+- Edge cases or parsing failures
+- FTDC decoding issues

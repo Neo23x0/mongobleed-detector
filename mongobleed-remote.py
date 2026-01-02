@@ -1,32 +1,60 @@
 #!/usr/bin/env python3
 """
 mongobleed-remote.py
-Remote MongoDB Log Analysis Tool for CVE-2025-14847 (MongoBleed)
+Remote MongoDB Data Collection and Analysis for CVE-2025-14847 (MongoBleed)
 
-Executes mongobleed-detector.sh on multiple remote hosts via SSH
-and aggregates results into a combined report.
+Collects data from multiple remote hosts via SSH:
+- MongoDB logs
+- serverStatus().asserts snapshots (via mongosh)
+- FTDC diagnostic.data files
+
+Then runs mongobleed-detector.sh locally on the collected data.
 
 Uses native SSH - no additional Python dependencies required.
 Respects ~/.ssh/config, ssh-agent, and ProxyJump configurations.
 """
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 SCRIPT_DIR = Path(__file__).parent
 DETECTOR_SCRIPT = SCRIPT_DIR / "mongobleed-detector.sh"
 
+# Default remote paths
+DEFAULT_LOG_PATHS = [
+    "/var/log/mongodb/mongod.log",
+    "/var/log/mongodb/mongod.log.1",
+    "/var/log/mongodb/mongod.log.2.gz",
+]
+DEFAULT_FTDC_PATHS = [
+    "/var/lib/mongodb/diagnostic.data",
+    "/data/db/diagnostic.data",
+]
+
 # Risk level sort order
 RISK_ORDER = {"HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+
+
+@dataclass
+class CollectionResult:
+    """Results from collecting data from a single host."""
+    hostname: str
+    success: bool
+    error: Optional[str] = None
+    logs_collected: int = 0
+    asserts_collected: bool = False
+    ftdc_collected: int = 0
 
 
 @dataclass
@@ -58,24 +86,28 @@ class Finding:
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Remote MongoDB Log Analysis for CVE-2025-14847 (MongoBleed)",
+        description="Remote MongoDB Data Collection and Analysis for CVE-2025-14847 (MongoBleed)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Uses native SSH - respects ~/.ssh/config, ssh-agent, and ProxyJump.
 No additional Python dependencies required.
 
+This tool operates in two phases:
+  1. Collection: Gathers logs, assert-counts, and FTDC files from remote hosts
+  2. Analysis: Runs mongobleed-detector.sh locally on collected data
+
 Examples:
-    # Scan hosts from a file
-    %(prog)s --hosts-file hosts.txt --user admin
+    # Collect and analyze data from hosts
+    %(prog)s --hosts-file hosts.txt --user admin --output-dir ./collected-data
 
-    # Scan specific hosts
-    %(prog)s --host mongo1.example.com --host mongo2.example.com --user admin
+    # Collect from specific hosts with custom log paths
+    %(prog)s --host mongo1 --host mongo2 --user admin --log-path /custom/path/*.log
 
-    # Use specific SSH key
-    %(prog)s --hosts-file hosts.txt --user admin --key ~/.ssh/mongodb_key
+    # Skip FTDC collection (faster, but less accurate)
+    %(prog)s --hosts-file hosts.txt --user admin --skip-ftdc
 
-    # Parallel execution with custom detector options
-    %(prog)s --hosts-file hosts.txt --user admin --parallel 10 --time 1440
+    # Collect only, don't analyze
+    %(prog)s --hosts-file hosts.txt --user admin --collect-only
         """
     )
     
@@ -122,6 +154,49 @@ Examples:
         help="Additional SSH options (repeatable, e.g., -o 'ProxyJump=bastion')"
     )
     
+    # Collection options
+    collect_group = parser.add_argument_group("Collection Options")
+    collect_group.add_argument(
+        "--output-dir", "-O",
+        type=Path,
+        default=Path("./collected-data"),
+        help="Directory to store collected data (default: ./collected-data)"
+    )
+    collect_group.add_argument(
+        "--log-path",
+        action="append",
+        dest="log_paths",
+        metavar="PATH",
+        help="Remote log path to collect (repeatable)"
+    )
+    collect_group.add_argument(
+        "--ftdc-path",
+        action="append",
+        dest="ftdc_paths",
+        metavar="PATH",
+        help="Remote FTDC directory path (repeatable)"
+    )
+    collect_group.add_argument(
+        "--skip-logs",
+        action="store_true",
+        help="Skip log collection"
+    )
+    collect_group.add_argument(
+        "--skip-asserts",
+        action="store_true",
+        help="Skip serverStatus().asserts collection"
+    )
+    collect_group.add_argument(
+        "--skip-ftdc",
+        action="store_true",
+        help="Skip FTDC file collection"
+    )
+    collect_group.add_argument(
+        "--collect-only",
+        action="store_true",
+        help="Only collect data, don't run analysis"
+    )
+    
     # Execution options
     exec_group = parser.add_argument_group("Execution Options")
     exec_group.add_argument(
@@ -166,11 +241,10 @@ Examples:
         help="Metadata rate threshold (default: 0.10)"
     )
     detector_group.add_argument(
-        "--path", "-p",
-        action="append",
-        dest="log_paths",
-        metavar="GLOB",
-        help="Additional log path on remote hosts (repeatable)"
+        "--spike-threshold",
+        type=int,
+        default=100,
+        help="Assert spike threshold (default: 100)"
     )
     
     # Output options
@@ -200,6 +274,12 @@ Examples:
     if not shutil.which("scp"):
         parser.error("scp command not found in PATH")
     
+    # Set default paths if not specified
+    if not args.log_paths:
+        args.log_paths = DEFAULT_LOG_PATHS
+    if not args.ftdc_paths:
+        args.ftdc_paths = DEFAULT_FTDC_PATHS
+    
     return args
 
 
@@ -207,11 +287,9 @@ def load_hosts(args) -> list[str]:
     """Load host list from arguments and/or file."""
     hosts = []
     
-    # Add hosts from command line
     if args.hosts:
         hosts.extend(args.hosts)
     
-    # Add hosts from file
     if args.hosts_file:
         if not args.hosts_file.exists():
             print(f"ERROR: Hosts file not found: {args.hosts_file}", file=sys.stderr)
@@ -220,7 +298,6 @@ def load_hosts(args) -> list[str]:
         with open(args.hosts_file) as f:
             for line in f:
                 line = line.strip()
-                # Skip empty lines and comments
                 if line and not line.startswith("#"):
                     hosts.append(line)
     
@@ -239,280 +316,312 @@ def build_ssh_command(args, hostname: str) -> list[str]:
     """Build the base SSH command with options."""
     cmd = ["ssh"]
     
-    # Add SSH options
-    cmd.extend(["-o", "BatchMode=yes"])  # No password prompts
-    cmd.extend(["-o", "StrictHostKeyChecking=accept-new"])  # Accept new host keys
+    cmd.extend(["-o", "BatchMode=yes"])
+    cmd.extend(["-o", "StrictHostKeyChecking=accept-new"])
     cmd.extend(["-o", f"ConnectTimeout={min(30, args.timeout)}"])
     
-    # Port
     if args.port != 22:
         cmd.extend(["-p", str(args.port)])
     
-    # SSH key
     if args.key:
         cmd.extend(["-i", str(args.key)])
     
-    # Additional SSH options
     if args.ssh_opts:
         for opt in args.ssh_opts:
             cmd.extend(["-o", opt])
     
-    # User@host
     cmd.append(f"{args.user}@{hostname}")
     
     return cmd
 
 
-def build_scp_command(args, hostname: str, src: str, dst: str) -> list[str]:
-    """Build SCP command with options."""
+def build_scp_command(args, hostname: str, src: str, dst: str, recursive: bool = False) -> list[str]:
+    """Build SCP command to copy from remote to local."""
     cmd = ["scp"]
     
-    # Add options
     cmd.extend(["-o", "BatchMode=yes"])
     cmd.extend(["-o", "StrictHostKeyChecking=accept-new"])
     cmd.extend(["-o", f"ConnectTimeout={min(30, args.timeout)}"])
     
-    # Port
+    if recursive:
+        cmd.append("-r")
+    
     if args.port != 22:
         cmd.extend(["-P", str(args.port)])
     
-    # SSH key
     if args.key:
         cmd.extend(["-i", str(args.key)])
     
-    # Additional SSH options
     if args.ssh_opts:
         for opt in args.ssh_opts:
             cmd.extend(["-o", opt])
     
-    # Source and destination
-    cmd.append(src)
-    cmd.append(f"{args.user}@{hostname}:{dst}")
+    cmd.append(f"{args.user}@{hostname}:{src}")
+    cmd.append(dst)
     
     return cmd
 
 
-def build_detector_command(args) -> str:
-    """Build the detector command with options."""
-    cmd_parts = ["/tmp/mongobleed-detector.sh"]
+def collect_logs(hostname: str, args, host_dir: Path) -> int:
+    """Collect log files from remote host. Returns number of files collected."""
+    logs_dir = host_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
     
-    cmd_parts.extend(["-t", str(args.time)])
-    cmd_parts.extend(["-c", str(args.conn_threshold)])
-    cmd_parts.extend(["-b", str(args.burst_threshold)])
-    cmd_parts.extend(["-m", str(args.metadata_rate)])
-    
-    if args.log_paths:
-        for path in args.log_paths:
-            cmd_parts.extend(["-p", f"'{path}'"])
-    
-    return " ".join(cmd_parts)
-
-
-def analyze_host(hostname: str, args) -> HostResult:
-    """Analyze a single remote host via SSH."""
-    result = HostResult(hostname=hostname, success=False)
-    
-    try:
-        # Step 1: Copy script to remote host
-        scp_cmd = build_scp_command(
-            args, hostname,
-            str(DETECTOR_SCRIPT),
-            "/tmp/mongobleed-detector.sh"
+    collected = 0
+    for log_path in args.log_paths:
+        # Check if file exists on remote
+        ssh_cmd = build_ssh_command(args, hostname)
+        ssh_cmd.append(f"test -f {log_path} && echo exists")
+        
+        result = subprocess.run(
+            ssh_cmd,
+            capture_output=True,
+            text=True,
+            timeout=30
         )
         
-        scp_result = subprocess.run(
-            scp_cmd,
+        if "exists" in result.stdout:
+            # Copy the file
+            local_name = Path(log_path).name
+            scp_cmd = build_scp_command(
+                args, hostname,
+                log_path,
+                str(logs_dir / local_name)
+            )
+            
+            scp_result = subprocess.run(
+                scp_cmd,
+                capture_output=True,
+                text=True,
+                timeout=120
+            )
+            
+            if scp_result.returncode == 0:
+                collected += 1
+    
+    return collected
+
+
+def collect_assert_counts(hostname: str, args, host_dir: Path) -> bool:
+    """Collect serverStatus().asserts from remote host. Returns success status."""
+    asserts_dir = host_dir / "assert-counts"
+    asserts_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Build mongosh command to get asserts
+    mongosh_cmd = """
+    mongosh --quiet --eval 'JSON.stringify({
+        timestamp: new Date().toISOString(),
+        hostname: db.hostInfo().system.hostname || "unknown",
+        asserts: db.serverStatus().asserts,
+        uptime: db.serverStatus().uptime
+    })'
+    """
+    
+    ssh_cmd = build_ssh_command(args, hostname)
+    ssh_cmd.append(mongosh_cmd.strip())
+    
+    try:
+        result = subprocess.run(
+            ssh_cmd,
             capture_output=True,
             text=True,
             timeout=60
         )
         
-        if scp_result.returncode != 0:
-            error_msg = scp_result.stderr.strip() or "SCP failed"
-            # Clean up common SSH error messages
-            if "Permission denied" in error_msg:
-                result.error = "SSH authentication failed"
-            elif "Connection refused" in error_msg:
-                result.error = "Connection refused"
-            elif "No route to host" in error_msg or "Host is unreachable" in error_msg:
-                result.error = "Host unreachable"
-            elif "Connection timed out" in error_msg:
-                result.error = "Connection timeout"
-            else:
-                result.error = error_msg[:80]
-            return result
-        
-        # Step 2: Make script executable and run it
+        if result.returncode == 0 and result.stdout.strip():
+            # Validate JSON
+            try:
+                data = json.loads(result.stdout.strip())
+                if "asserts" in data:
+                    # Save to file
+                    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                    output_file = asserts_dir / f"asserts-{timestamp}.json"
+                    with open(output_file, 'w') as f:
+                        json.dump(data, f, indent=2)
+                    return True
+            except json.JSONDecodeError:
+                pass
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
+        pass
+    
+    return False
+
+
+def collect_ftdc_files(hostname: str, args, host_dir: Path) -> int:
+    """Collect FTDC files from remote host. Returns number of files collected."""
+    ftdc_dir = host_dir / "ftdc-files"
+    ftdc_dir.mkdir(parents=True, exist_ok=True)
+    
+    collected = 0
+    for ftdc_path in args.ftdc_paths:
+        # Check if directory exists and has metrics files
         ssh_cmd = build_ssh_command(args, hostname)
-        detector_cmd = build_detector_command(args)
-        ssh_cmd.append(f"chmod +x /tmp/mongobleed-detector.sh && {detector_cmd}")
+        ssh_cmd.append(f"test -d {ftdc_path} && ls {ftdc_path}/metrics.* 2>/dev/null | head -5")
         
-        ssh_result = subprocess.run(
+        result = subprocess.run(
             ssh_cmd,
             capture_output=True,
             text=True,
-            timeout=args.timeout
+            timeout=30
         )
         
-        # Step 3: Clean up remote script
-        cleanup_cmd = build_ssh_command(args, hostname)
-        cleanup_cmd.append("rm -f /tmp/mongobleed-detector.sh")
-        subprocess.run(cleanup_cmd, capture_output=True, timeout=30)
+        if result.returncode == 0 and result.stdout.strip():
+            # Copy metrics files (limited to most recent)
+            for remote_file in result.stdout.strip().split('\n'):
+                if remote_file:
+                    local_name = Path(remote_file).name
+                    scp_cmd = build_scp_command(
+                        args, hostname,
+                        remote_file,
+                        str(ftdc_dir / local_name)
+                    )
+                    
+                    scp_result = subprocess.run(
+                        scp_cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=120
+                    )
+                    
+                    if scp_result.returncode == 0:
+                        collected += 1
+            
+            # If we found files in this path, don't check other paths
+            if collected > 0:
+                break
+    
+    return collected
+
+
+def collect_from_host(hostname: str, args, output_dir: Path) -> CollectionResult:
+    """Collect all data from a single host."""
+    result = CollectionResult(hostname=hostname, success=False)
+    
+    # Create host-specific directory
+    host_dir = output_dir / hostname
+    host_dir.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        # Collect logs
+        if not args.skip_logs:
+            result.logs_collected = collect_logs(hostname, args, host_dir)
         
-        # Parse results
-        if ssh_result.returncode == 2:
-            result.error = ssh_result.stderr.strip()[:80] or "Detector script error"
-            return result
+        # Collect assert counts
+        if not args.skip_asserts:
+            result.asserts_collected = collect_assert_counts(hostname, args, host_dir)
         
-        result.success = True
-        result.findings = parse_detector_output(hostname, ssh_result.stdout)
+        # Collect FTDC files
+        if not args.skip_ftdc:
+            result.ftdc_collected = collect_ftdc_files(hostname, args, host_dir)
         
-        for finding in result.findings:
-            if finding.risk == "HIGH":
-                result.high_count += 1
-            elif finding.risk == "MEDIUM":
-                result.medium_count += 1
+        # Mark as success if we collected anything
+        if result.logs_collected > 0 or result.asserts_collected or result.ftdc_collected > 0:
+            result.success = True
+        else:
+            result.error = "No data collected"
         
     except subprocess.TimeoutExpired:
-        result.error = "Command timeout"
-    except FileNotFoundError as e:
-        result.error = f"Command not found: {e.filename}"
+        result.error = "Connection timeout"
     except Exception as e:
-        result.error = f"Error: {str(e)[:60]}"
+        result.error = str(e)[:80]
     
     return result
 
 
-def parse_detector_output(hostname: str, output: str) -> list[Finding]:
-    """Parse detector output and extract findings."""
-    findings = []
+def reorganize_for_analysis(output_dir: Path) -> Path:
+    """Reorganize collected data into the standard structure for analysis."""
+    # Create combined directories
+    combined_dir = output_dir / "_combined"
+    logs_dir = combined_dir / "logs"
+    asserts_dir = combined_dir / "assert-counts"
+    ftdc_dir = combined_dir / "ftdc-files"
     
-    in_table = False
-    for line in output.split("\n"):
-        line = line.strip()
-        
-        # Detect start of data rows (after header separator)
-        if line.startswith("--------"):
-            in_table = True
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    asserts_dir.mkdir(parents=True, exist_ok=True)
+    ftdc_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Copy files from each host directory
+    for host_dir in output_dir.iterdir():
+        if not host_dir.is_dir() or host_dir.name.startswith("_"):
             continue
         
-        if not in_table:
-            continue
+        hostname = host_dir.name
         
-        # Stop at summary section
-        if line.startswith("═") or not line:
-            break
+        # Copy logs with hostname prefix
+        host_logs = host_dir / "logs"
+        if host_logs.exists():
+            for log_file in host_logs.iterdir():
+                if log_file.is_file():
+                    dest = logs_dir / f"{hostname}_{log_file.name}"
+                    shutil.copy2(log_file, dest)
         
-        # Parse data row
-        parts = line.split()
-        if len(parts) >= 9:
-            try:
-                risk = parts[0]
-                if risk not in RISK_ORDER:
-                    continue
-                
-                finding = Finding(
-                    hostname=hostname,
-                    risk=risk,
-                    source_ip=parts[1],
-                    conn_count=int(parts[2]),
-                    meta_count=int(parts[3]),
-                    disc_count=int(parts[4]),
-                    meta_rate=parts[5],
-                    burst_rate=parts[6],
-                    first_seen=parts[7],
-                    last_seen=parts[8] if len(parts) > 8 else ""
-                )
-                findings.append(finding)
-            except (ValueError, IndexError):
-                continue
+        # Copy assert-counts with hostname prefix
+        host_asserts = host_dir / "assert-counts"
+        if host_asserts.exists():
+            for assert_file in host_asserts.iterdir():
+                if assert_file.is_file():
+                    dest = asserts_dir / f"{hostname}_{assert_file.name}"
+                    shutil.copy2(assert_file, dest)
+        
+        # Copy FTDC files with hostname prefix
+        host_ftdc = host_dir / "ftdc-files"
+        if host_ftdc.exists():
+            for ftdc_file in host_ftdc.iterdir():
+                if ftdc_file.is_file():
+                    dest = ftdc_dir / f"{hostname}_{ftdc_file.name}"
+                    shutil.copy2(ftdc_file, dest)
     
-    return findings
+    return combined_dir
 
 
-def print_combined_results(results: list[HostResult], args):
-    """Print combined results table."""
-    # Collect all findings
-    all_findings = []
-    for result in results:
-        all_findings.extend(result.findings)
+def run_analysis(data_dir: Path, args) -> int:
+    """Run mongobleed-detector.sh on collected data. Returns exit code."""
+    cmd = [
+        str(DETECTOR_SCRIPT),
+        "--data-dir", str(data_dir),
+        "-t", str(args.time),
+        "-c", str(args.conn_threshold),
+        "-b", str(args.burst_threshold),
+        "-m", str(args.metadata_rate),
+        "--spike-threshold", str(args.spike_threshold),
+    ]
     
-    # Sort by risk level, then hostname, then connection count
-    all_findings.sort(key=lambda f: (
-        RISK_ORDER.get(f.risk, 99),
-        f.hostname,
-        -f.conn_count
-    ))
-    
-    # Count totals
-    total_high = sum(r.high_count for r in results)
-    total_medium = sum(r.medium_count for r in results)
-    successful_hosts = sum(1 for r in results if r.success)
-    failed_hosts = [r for r in results if not r.success]
-    
-    # Print header
+    result = subprocess.run(cmd)
+    return result.returncode
+
+
+def print_collection_summary(results: list[CollectionResult], args):
+    """Print summary of collection results."""
     print()
-    print("╔" + "═" * 130 + "╗")
-    print("║" + "MongoBleed (CVE-2025-14847) Remote Analysis Results".center(130) + "║")
-    print("╚" + "═" * 130 + "╝")
-    print()
-    print(f"Hosts Analyzed: {successful_hosts}/{len(results)}")
+    print("╔" + "═" * 80 + "╗")
+    print("║" + "MongoBleed Data Collection Summary".center(80) + "║")
+    print("╚" + "═" * 80 + "╝")
     print()
     
-    # Print failures if any
-    if failed_hosts:
+    successful = [r for r in results if r.success]
+    failed = [r for r in results if not r.success]
+    
+    print(f"Hosts: {len(successful)}/{len(results)} successful")
+    print()
+    
+    if successful:
+        print("Collected Data:")
+        print(f"{'Hostname':<30} {'Logs':<10} {'Asserts':<10} {'FTDC':<10}")
+        print("-" * 60)
+        for r in successful:
+            asserts_str = "✓" if r.asserts_collected else "−"
+            print(f"{r.hostname:<30} {r.logs_collected:<10} {asserts_str:<10} {r.ftdc_collected:<10}")
+        print()
+    
+    if failed:
         print("Failed Hosts:")
-        for r in failed_hosts:
+        for r in failed:
             print(f"  ✗ {r.hostname}: {r.error}")
         print()
     
-    if not all_findings:
-        if successful_hosts > 0:
-            print("No findings detected across all hosts.")
-        print()
-        return
-    
-    # Print table header
-    header = f"{'Hostname':<20} {'Risk':<8} {'SourceIP':<40} {'ConnCount':>10} {'MetaCount':>10} {'DiscCount':>10} {'MetaRate%':>12} {'BurstRate/m':>14}"
-    separator = f"{'-'*20} {'-'*8} {'-'*40} {'-'*10} {'-'*10} {'-'*10} {'-'*12} {'-'*14}"
-    
-    print(header)
-    print(separator)
-    
-    # Print findings
-    for f in all_findings:
-        # Color codes
-        if f.risk == "HIGH":
-            color = "\033[0;31m"  # Red
-        elif f.risk == "MEDIUM":
-            color = "\033[0;33m"  # Yellow
-        elif f.risk == "LOW":
-            color = "\033[0;32m"  # Green
-        else:
-            color = ""
-        reset = "\033[0m" if color else ""
-        
-        print(f"{f.hostname:<20} {color}{f.risk:<8}{reset} {f.source_ip:<40} {f.conn_count:>10} {f.meta_count:>10} {f.disc_count:>10} {f.meta_rate:>12} {f.burst_rate:>14}")
-    
-    # Print summary
-    print()
-    print("═" * 132)
-    print("Summary:")
-    if total_high > 0:
-        print(f"  \033[0;31mHIGH:\033[0m   {total_high} finding(s) - Likely exploitation detected")
-    if total_medium > 0:
-        print(f"  \033[0;33mMEDIUM:\033[0m {total_medium} finding(s) - Suspicious activity, investigation recommended")
-    
-    if total_high > 0 or total_medium > 0:
-        print()
-        print("\033[1m\033[0;31m⚠ IMPORTANT:\033[0m If exploitation is confirmed, patching alone is insufficient.")
-        print("  - Rotate all credentials that may have been exposed")
-        print("  - Review accessed data for sensitive information disclosure")
-        print("  - Check for lateral movement from affected systems")
-        print("  - Preserve logs for forensic analysis")
-    else:
-        print("  No HIGH or MEDIUM risk findings detected.")
-    
+    print(f"Data saved to: {args.output_dir}")
     print()
 
 
@@ -525,16 +634,19 @@ def main():
         print("ERROR: No hosts specified", file=sys.stderr)
         sys.exit(2)
     
+    # Create output directory
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    
     if not args.quiet:
-        print(f"MongoBleed Remote Scanner v{VERSION}")
-        print(f"Scanning {len(hosts)} host(s) with {args.parallel} parallel connections...")
+        print(f"MongoBleed Remote Collector v{VERSION}")
+        print(f"Collecting from {len(hosts)} host(s) with {args.parallel} parallel connections...")
         print()
     
-    # Execute on all hosts in parallel
-    results = []
+    # Phase 1: Collection
+    collection_results = []
     with ThreadPoolExecutor(max_workers=args.parallel) as executor:
         futures = {
-            executor.submit(analyze_host, host, args): host
+            executor.submit(collect_from_host, host, args, args.output_dir): host
             for host in hosts
         }
         
@@ -542,35 +654,52 @@ def main():
             host = futures[future]
             try:
                 result = future.result()
-                results.append(result)
+                collection_results.append(result)
                 
                 if not args.quiet:
                     if result.success:
-                        if result.high_count:
-                            status = f"\033[0;31m✓ {result.high_count} HIGH\033[0m"
-                        elif result.medium_count:
-                            status = f"\033[0;33m✓ {result.medium_count} MEDIUM\033[0m"
-                        else:
-                            status = "\033[0;32m✓ OK\033[0m"
+                        parts = []
+                        if result.logs_collected:
+                            parts.append(f"{result.logs_collected} logs")
+                        if result.asserts_collected:
+                            parts.append("asserts")
+                        if result.ftdc_collected:
+                            parts.append(f"{result.ftdc_collected} ftdc")
+                        status = f"\033[0;32m✓ {', '.join(parts)}\033[0m"
                     else:
                         status = f"\033[0;31m✗ {result.error}\033[0m"
                     print(f"  [{status}] {host}")
                     
             except Exception as e:
-                results.append(HostResult(hostname=host, success=False, error=str(e)))
+                collection_results.append(
+                    CollectionResult(hostname=host, success=False, error=str(e))
+                )
                 if not args.quiet:
                     print(f"  [\033[0;31m✗ Error\033[0m] {host}: {e}")
     
-    # Print combined results
-    print_combined_results(results, args)
+    # Print collection summary
+    print_collection_summary(collection_results, args)
     
-    # Exit code based on findings
-    total_high = sum(r.high_count for r in results)
-    total_medium = sum(r.medium_count for r in results)
+    # Check if we have any data
+    successful = [r for r in collection_results if r.success]
+    if not successful:
+        print("ERROR: No data collected from any host", file=sys.stderr)
+        sys.exit(2)
     
-    if total_high > 0 or total_medium > 0:
-        sys.exit(1)
-    sys.exit(0)
+    if args.collect_only:
+        print("Collection complete. Run analysis manually with:")
+        print(f"  ./mongobleed-detector.sh --data-dir {args.output_dir}/_combined/")
+        sys.exit(0)
+    
+    # Phase 2: Reorganize and analyze
+    print("Reorganizing data for analysis...")
+    combined_dir = reorganize_for_analysis(args.output_dir)
+    
+    print("Running analysis...")
+    print()
+    
+    exit_code = run_analysis(combined_dir, args)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

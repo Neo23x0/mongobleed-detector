@@ -38,12 +38,18 @@ info() {
 }
 
 #
+# ============================================================================
+# MODULE A TESTS (Log Correlation)
+# ============================================================================
+#
+
+#
 # Test: Example log exploitation detection
 #
 test_example_log_exploitation() {
     info "Testing: Example log exploitation detection"
     
-    local example_log="$PROJECT_DIR/example-logs/mongod.log"
+    local example_log="$PROJECT_DIR/example-data/logs/mongod.log"
     
     if [[ ! -f "$example_log" ]]; then
         fail "Example log not found: $example_log"
@@ -53,7 +59,8 @@ test_example_log_exploitation() {
     local output
     local exit_code
     
-    output=$(/bin/bash "$DETECTOR" --no-default-paths -p "$example_log" 2>&1) || exit_code=$?
+    # Use 30-day lookback to catch older example logs
+    output=$(/bin/bash "$DETECTOR" --no-default-paths -p "$example_log" -t 43200 2>&1) || exit_code=$?
     exit_code=${exit_code:-0}
     
     # Should exit with 1 (HIGH or MEDIUM findings)
@@ -272,7 +279,289 @@ test_custom_thresholds() {
 }
 
 #
-# Main
+# ============================================================================
+# MODULE B1 TESTS (Assert Counts)
+# ============================================================================
+#
+
+#
+# Test: Assert counts with spike detection
+#
+test_assert_counts_spike() {
+    info "Testing: Assert counts spike detection (Module B1)"
+    
+    local data_dir="$SCRIPT_DIR/collected-data"
+    
+    if [[ ! -d "$data_dir/assert-counts" ]]; then
+        fail "Test data not found: $data_dir (run generate-test-logs.sh first)"
+        return
+    fi
+    
+    local output
+    local exit_code
+    
+    output=$(/bin/bash "$DETECTOR" --data-dir "$data_dir" -t 4320 2>&1) || exit_code=$?
+    exit_code=${exit_code:-0}
+    
+    # Should show Module B1 status
+    if echo "$output" | grep -q "Module B1"; then
+        pass "Shows Module B1 status"
+    else
+        fail "Missing Module B1 status"
+    fi
+    
+    # Should detect the spike
+    if echo "$output" | grep -qi "SPIKE"; then
+        pass "Detected assert spike"
+    else
+        fail "Did not detect assert spike"
+    fi
+    
+    # Should show the delta
+    if echo "$output" | grep -q "740"; then
+        pass "Shows spike delta (740)"
+    else
+        fail "Missing spike delta value"
+    fi
+}
+
+#
+# Test: Single snapshot (informational only)
+#
+test_single_snapshot() {
+    info "Testing: Single assert snapshot (informational)"
+    
+    local data_dir="$SCRIPT_DIR/collected-data-single-snapshot"
+    
+    if [[ ! -d "$data_dir/assert-counts" ]]; then
+        fail "Test data not found: $data_dir (run generate-test-logs.sh first)"
+        return
+    fi
+    
+    local output
+    
+    output=$(/bin/bash "$DETECTOR" --data-dir "$data_dir" -t 4320 2>&1) || true
+    
+    # Should indicate single snapshot (either "single snapshot" or "1 snapshot")
+    if echo "$output" | grep -qi "single snapshot\|informational\|1 snapshot"; then
+        pass "Indicates single snapshot"
+    else
+        fail "Missing single snapshot indication"
+    fi
+}
+
+#
+# Test: No spikes (stable system)
+#
+test_no_spikes() {
+    info "Testing: Stable system with no spikes"
+    
+    local data_dir="$SCRIPT_DIR/collected-data-no-spikes"
+    
+    if [[ ! -d "$data_dir/assert-counts" ]]; then
+        fail "Test data not found: $data_dir (run generate-test-logs.sh first)"
+        return
+    fi
+    
+    local output
+    local exit_code
+    
+    output=$(/bin/bash "$DETECTOR" --data-dir "$data_dir" -t 4320 2>&1) || exit_code=$?
+    exit_code=${exit_code:-0}
+    
+    # Should not detect spikes
+    if ! echo "$output" | grep -qi "SPIKE DETECTED"; then
+        pass "No spikes detected in stable data"
+    else
+        fail "Incorrectly detected spikes in stable data"
+    fi
+    
+    # Should exit 0 (no findings)
+    if [[ $exit_code -eq 0 ]]; then
+        pass "Exit code 0 for stable system"
+    else
+        fail "Expected exit code 0, got $exit_code"
+    fi
+}
+
+#
+# ============================================================================
+# REAL-WORLD DATA TESTS
+# ============================================================================
+#
+
+#
+# Test: Real-world example data (aws-debian attack)
+#
+test_real_world_example() {
+    info "Testing: Real-world example data from aws-debian"
+    
+    local data_dir="$PROJECT_DIR/example-data"
+    
+    if [[ ! -d "$data_dir" ]]; then
+        fail "Example data not found: $data_dir"
+        return
+    fi
+    
+    local output
+    local exit_code
+    
+    # Use 30-day lookback for older logs
+    output=$(/bin/bash "$DETECTOR" --data-dir "$data_dir" -t 43200 2>&1) || exit_code=$?
+    exit_code=${exit_code:-0}
+    
+    # Should detect HIGH risk for 137.137.137.137
+    if echo "$output" | grep -qE "^HIGH\s+137\.137\.137\.137"; then
+        pass "Detected attacker IP 137.137.137.137 as HIGH risk"
+    else
+        fail "Did not classify 137.137.137.137 as HIGH risk"
+    fi
+    
+    # Should show real assert count (37384)
+    if echo "$output" | grep -q "37384"; then
+        pass "Shows real assert.user count (37384)"
+    else
+        fail "Missing real assert count"
+    fi
+    
+    # Should show module status for all three
+    if echo "$output" | grep -q "Module A.*log" && \
+       echo "$output" | grep -q "Module B1.*Assert" && \
+       echo "$output" | grep -q "Module B2.*FTDC"; then
+        pass "Shows status for all three modules"
+    else
+        fail "Missing module status"
+    fi
+    
+    # Should detect FTDC spikes if pymongo is available
+    if echo "$output" | grep -q "spike.*detected\|FTDC samples"; then
+        pass "FTDC decoder working (spikes detected)"
+    else
+        # This is acceptable if pymongo is not installed
+        info "FTDC decoder not available (pymongo not installed)"
+    fi
+    
+    # Should exit 1 (findings detected)
+    if [[ $exit_code -eq 1 ]]; then
+        pass "Exit code 1 (findings detected)"
+    else
+        fail "Expected exit code 1, got $exit_code"
+    fi
+}
+
+#
+# ============================================================================
+# AUTO-DISCOVERY MODE TESTS
+# ============================================================================
+#
+
+#
+# Test: Auto-discovery with combined data
+#
+test_auto_discovery_combined() {
+    info "Testing: Auto-discovery mode with logs + assert-counts"
+    
+    local data_dir="$SCRIPT_DIR/collected-data"
+    
+    if [[ ! -d "$data_dir" ]]; then
+        fail "Test data not found: $data_dir (run generate-test-logs.sh first)"
+        return
+    fi
+    
+    local output
+    local exit_code
+    
+    output=$(/bin/bash "$DETECTOR" --data-dir "$data_dir" -t 4320 2>&1) || exit_code=$?
+    exit_code=${exit_code:-0}
+    
+    # Should show module status for A and B1
+    if echo "$output" | grep -q "Module A"; then
+        pass "Shows Module A status"
+    else
+        fail "Missing Module A status"
+    fi
+    
+    if echo "$output" | grep -q "Module B1"; then
+        pass "Shows Module B1 status"
+    else
+        fail "Missing Module B1 status"
+    fi
+    
+    # Should show combined verdict
+    if echo "$output" | grep -qi "Combined Verdict"; then
+        pass "Shows combined verdict"
+    else
+        fail "Missing combined verdict"
+    fi
+    
+    # Should exit 1 (has findings from both modules)
+    if [[ $exit_code -eq 1 ]]; then
+        pass "Exit code 1 (findings detected)"
+    else
+        fail "Expected exit code 1, got $exit_code"
+    fi
+}
+
+#
+# Test: Module B2 unavailable warning
+#
+test_b2_unavailable() {
+    info "Testing: Module B2 shows as unavailable without FTDC"
+    
+    local data_dir="$SCRIPT_DIR/collected-data"
+    
+    if [[ ! -d "$data_dir" ]]; then
+        fail "Test data not found: $data_dir"
+        return
+    fi
+    
+    local output
+    
+    output=$(/bin/bash "$DETECTOR" --data-dir "$data_dir" -t 4320 2>&1) || true
+    
+    # Should show B2 as unavailable (no FTDC files in test data)
+    if echo "$output" | grep -q "Module B2.*FTDC.*unavailable\|−.*Module B2\|Module B2.*No FTDC"; then
+        pass "Module B2 marked as unavailable"
+    else
+        fail "Module B2 status not shown correctly"
+    fi
+}
+
+#
+# Test: Caveats displayed
+#
+test_caveats_displayed() {
+    info "Testing: Caveats are displayed"
+    
+    local data_dir="$SCRIPT_DIR/collected-data"
+    
+    if [[ ! -d "$data_dir" ]]; then
+        fail "Test data not found"
+        return
+    fi
+    
+    local output
+    
+    output=$(/bin/bash "$DETECTOR" --data-dir "$data_dir" -t 4320 2>&1) || true
+    
+    # Should show caveats
+    if echo "$output" | grep -q "Caveats"; then
+        pass "Shows caveats section"
+    else
+        fail "Missing caveats section"
+    fi
+    
+    if echo "$output" | grep -q "cumulative"; then
+        pass "Mentions cumulative counter caveat"
+    else
+        fail "Missing cumulative counter caveat"
+    fi
+}
+
+#
+# ============================================================================
+# MAIN
+# ============================================================================
 #
 main() {
     echo
@@ -287,7 +576,7 @@ main() {
         exit 2
     fi
     
-    # Run tests
+    echo -e "${BOLD}Module A Tests (Log Correlation):${RESET}"
     test_example_log_exploitation
     echo
     test_generated_high_risk
@@ -301,6 +590,26 @@ main() {
     test_help_and_version
     echo
     test_custom_thresholds
+    echo
+    
+    echo -e "${BOLD}Module B1 Tests (Assert Counts):${RESET}"
+    test_assert_counts_spike
+    echo
+    test_single_snapshot
+    echo
+    test_no_spikes
+    echo
+    
+    echo -e "${BOLD}Real-World Data Tests:${RESET}"
+    test_real_world_example
+    echo
+    
+    echo -e "${BOLD}Auto-Discovery Mode Tests:${RESET}"
+    test_auto_discovery_combined
+    echo
+    test_b2_unavailable
+    echo
+    test_caveats_displayed
     
     # Summary
     echo
@@ -324,4 +633,3 @@ main() {
 }
 
 main "$@"
-

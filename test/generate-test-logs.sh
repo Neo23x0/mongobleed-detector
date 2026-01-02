@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 #
-# Generate test MongoDB logs for validating mongobleed-detector
+# Generate test data for validating mongobleed-detector
+# Generates logs, assert-counts, and mock FTDC data
 #
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT_DIR="${SCRIPT_DIR}/logs"
+DATA_DIR="${SCRIPT_DIR}/collected-data"
 
 mkdir -p "$OUTPUT_DIR"
+mkdir -p "$DATA_DIR/logs"
+mkdir -p "$DATA_DIR/assert-counts"
+mkdir -p "$DATA_DIR/ftdc-files"
 
 # Get current timestamp in ISO format
 now_epoch=$(date +%s)
@@ -19,7 +24,22 @@ iso_date() {
     date -u -r "$epoch" '+%Y-%m-%dT%H:%M:%S.000Z'
 }
 
-echo "Generating test logs in $OUTPUT_DIR..."
+iso_date_short() {
+    local epoch="$1"
+    date -u -d "@$epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || \
+    date -u -r "$epoch" '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+echo "Generating test data..."
+echo
+
+#
+# ============================================================================
+# LOG FILES (Module A test data)
+# ============================================================================
+#
+
+echo "Generating log files in $OUTPUT_DIR..."
 
 #
 # Test Case 1: Exploitation Pattern (HIGH risk)
@@ -165,16 +185,173 @@ echo "  Creating malformed_mixed.log (error tolerance test)..."
     echo '{"t":{"$date":"2025-01-15T10:00:00.200Z"},"s":"I","c":"NETWORK","id":22944,"ctx":"conn1","msg":"end connection","attr":{"remote":"1.1.1.1:1111"}}'
 } > "$OUTPUT_DIR/malformed_mixed.log"
 
-echo ""
-echo "Test logs generated successfully!"
-echo ""
-echo "Run the detector with:"
-echo "  ../mongobleed-detector.sh --no-default-paths -p '$OUTPUT_DIR/*.log' -p '$OUTPUT_DIR/*.log.gz' -t 120"
-echo ""
-echo "Expected results:"
-echo "  HIGH:   10.0.0.99 (500 connections, 0% metadata, high burst)"
-echo "  MEDIUM: 10.0.0.50 (200 connections, 2.5% metadata, low burst)"
-echo "  MEDIUM: 2001:db8::1 (120 connections, 5% metadata, IPv6)"
-echo "  LOW:    172.16.0.25 (150 connections, 96.7% metadata)"
-echo "  INFO:   All others (< 100 connections)"
+echo
 
+#
+# ============================================================================
+# COLLECTED-DATA STRUCTURE (Module B test data)
+# ============================================================================
+#
+
+echo "Generating collected-data structure in $DATA_DIR..."
+
+# Copy exploit log to collected-data/logs for combined testing
+echo "  Creating collected-data/logs/..."
+cp "$OUTPUT_DIR/exploit_high.log" "$DATA_DIR/logs/"
+
+#
+# Assert-counts test data (Module B1)
+#
+
+echo "  Creating assert-counts JSON files..."
+
+# Multiple snapshots with a spike
+# Snapshot 1: baseline
+cat > "$DATA_DIR/assert-counts/asserts-snapshot-1.json" <<EOF
+{
+  "timestamp": "$(iso_date_short $((now_epoch - 3600)))",
+  "hostname": "mongo-test-01",
+  "asserts": {
+    "regular": 0,
+    "warning": 0,
+    "msg": 0,
+    "user": 100,
+    "tripwire": 0,
+    "rollovers": 0
+  },
+  "uptime": 86400
+}
+EOF
+
+# Snapshot 2: small increase (normal)
+cat > "$DATA_DIR/assert-counts/asserts-snapshot-2.json" <<EOF
+{
+  "timestamp": "$(iso_date_short $((now_epoch - 1800)))",
+  "hostname": "mongo-test-01",
+  "asserts": {
+    "regular": 0,
+    "warning": 0,
+    "msg": 0,
+    "user": 110,
+    "tripwire": 0,
+    "rollovers": 0
+  },
+  "uptime": 88200
+}
+EOF
+
+# Snapshot 3: SPIKE! (exploitation)
+cat > "$DATA_DIR/assert-counts/asserts-snapshot-3.json" <<EOF
+{
+  "timestamp": "$(iso_date_short $((now_epoch - 900)))",
+  "hostname": "mongo-test-01",
+  "asserts": {
+    "regular": 0,
+    "warning": 0,
+    "msg": 0,
+    "user": 850,
+    "tripwire": 0,
+    "rollovers": 0
+  },
+  "uptime": 89100
+}
+EOF
+
+# Snapshot 4: post-spike
+cat > "$DATA_DIR/assert-counts/asserts-snapshot-4.json" <<EOF
+{
+  "timestamp": "$(iso_date_short "$now_epoch")",
+  "hostname": "mongo-test-01",
+  "asserts": {
+    "regular": 0,
+    "warning": 0,
+    "msg": 0,
+    "user": 860,
+    "tripwire": 0,
+    "rollovers": 0
+  },
+  "uptime": 90000
+}
+EOF
+
+#
+# Create a separate test case: single snapshot (informational only)
+#
+mkdir -p "$DATA_DIR-single-snapshot/assert-counts"
+cat > "$DATA_DIR-single-snapshot/assert-counts/asserts-only.json" <<EOF
+{
+  "timestamp": "$(iso_date_short "$now_epoch")",
+  "hostname": "mongo-test-02",
+  "asserts": {
+    "regular": 0,
+    "warning": 0,
+    "msg": 0,
+    "user": 5000,
+    "tripwire": 0,
+    "rollovers": 0
+  },
+  "uptime": 864000
+}
+EOF
+
+#
+# Create a separate test case: no spikes (stable system)
+# Use small deltas (< 100 threshold) between snapshots
+#
+mkdir -p "$DATA_DIR-no-spikes/assert-counts"
+for i in 1 2 3 4 5; do
+    cat > "$DATA_DIR-no-spikes/assert-counts/asserts-${i}.json" <<EOF
+{
+  "timestamp": "$(iso_date_short $((now_epoch - (5-i)*600)))",
+  "hostname": "mongo-stable",
+  "asserts": {
+    "regular": 0,
+    "warning": 0,
+    "msg": 0,
+    "user": $((1000 + i*10)),
+    "tripwire": 0,
+    "rollovers": 0
+  },
+  "uptime": $((86400 + i*600))
+}
+EOF
+done
+
+echo
+
+#
+# ============================================================================
+# SUMMARY
+# ============================================================================
+#
+
+echo "Test data generated successfully!"
+echo
+echo "Log files in $OUTPUT_DIR:"
+echo "  HIGH:   exploit_high.log (500 connections, 0% metadata)"
+echo "  MEDIUM: suspicious_medium.log (200 connections, 2.5% metadata)"
+echo "  MEDIUM: ipv6_test.log (120 connections, 5% metadata, IPv6)"
+echo "  LOW:    highvolume_low.log (150 connections, 96.7% metadata)"
+echo "  INFO:   normal_info.log, mixed_traffic.log, compressed.log.gz"
+echo
+echo "Collected-data structures:"
+echo "  $DATA_DIR/"
+echo "    - logs/exploit_high.log"
+echo "    - assert-counts/*.json (4 snapshots with spike)"
+echo "  $DATA_DIR-single-snapshot/"
+echo "    - assert-counts/asserts-only.json (single snapshot, informational)"
+echo "  $DATA_DIR-no-spikes/"
+echo "    - assert-counts/*.json (5 snapshots, no spikes)"
+echo
+echo "Run tests with:"
+echo "  # Legacy log-only mode:"
+echo "  ../mongobleed-detector.sh --no-default-paths -p '$OUTPUT_DIR/*.log' -t 120"
+echo
+echo "  # Auto-discovery mode with collected data:"
+echo "  ../mongobleed-detector.sh --data-dir '$DATA_DIR' -t 120"
+echo
+echo "  # Test single snapshot (informational):"
+echo "  ../mongobleed-detector.sh --data-dir '$DATA_DIR-single-snapshot' -t 120"
+echo
+echo "  # Test no spikes (stable system):"
+echo "  ../mongobleed-detector.sh --data-dir '$DATA_DIR-no-spikes' -t 120"
