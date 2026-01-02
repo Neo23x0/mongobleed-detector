@@ -27,6 +27,7 @@ CONNECTION_THRESHOLD=100
 BURST_RATE_THRESHOLD=400
 METADATA_RATE_THRESHOLD=0.10
 SPIKE_THRESHOLD=100  # Delta threshold for assert spikes
+USER_RATIO_THRESHOLD=250  # Ratio threshold for single-snapshot heuristic
 
 # Runtime state
 ADDITIONAL_PATHS=()
@@ -98,6 +99,7 @@ ${BOLD}OPTIONS${RESET}
     -b, --burst-threshold   Burst rate threshold per minute (default: ${BURST_RATE_THRESHOLD})
     -m, --metadata-rate     Metadata rate threshold 0.0-1.0 (default: ${METADATA_RATE_THRESHOLD})
     --spike-threshold       Assert spike threshold (default: ${SPIKE_THRESHOLD})
+    --user-ratio-threshold  User/other assert ratio for single snapshot (default: ${USER_RATIO_THRESHOLD})
     --no-default-paths      Skip default log paths
     --forensic-dir <path>   Analyze subdirectories as separate hosts
     -h, --help              Show this help message
@@ -248,6 +250,14 @@ parse_args() {
                     exit 2
                 fi
                 SPIKE_THRESHOLD="$2"
+                shift 2
+                ;;
+            --user-ratio-threshold)
+                if [[ -z "${2:-}" ]] || ! [[ "$2" =~ ^[0-9]+$ ]]; then
+                    error "Option $1 requires a positive integer"
+                    exit 2
+                fi
+                USER_RATIO_THRESHOLD="$2"
                 shift 2
                 ;;
             --no-default-paths)
@@ -626,6 +636,7 @@ analyze_logs() {
 analyze_assert_counts() {
     local assert_dir="$1"
     local threshold="$2"
+    local ratio_threshold="$3"
     
     # Collect and sort JSON files by timestamp
     local json_files=()
@@ -640,13 +651,13 @@ analyze_assert_counts() {
         return
     fi
     
-    # Parse all JSON files and extract asserts data
+    # Parse all JSON files and extract asserts data (including all types for ratio analysis)
     local all_data=""
     for file in "${json_files[@]}"; do
         local data
         data=$(jq -r '
             if .timestamp and .asserts then
-                "\(.timestamp)|\(.hostname // "unknown")|\(.asserts.user // 0)|\(.asserts.rollovers // 0)|\(.uptime // 0)"
+                "\(.timestamp)|\(.hostname // "unknown")|\(.asserts.user // 0)|\(.asserts.rollovers // 0)|\(.uptime // 0)|\(.asserts.regular // 0)|\(.asserts.warning // 0)|\(.asserts.msg // 0)|\(.asserts.tripwire // 0)"
             else
                 empty
             end
@@ -660,13 +671,17 @@ analyze_assert_counts() {
     fi
     
     # Sort by timestamp and compute deltas (filter empty lines first)
-    echo "$all_data" | grep -v '^$' | sort -t'|' -k1,1 | awk -F'|' -v threshold="$threshold" '
+    echo "$all_data" | grep -v '^$' | sort -t'|' -k1,1 | awk -F'|' -v threshold="$threshold" -v ratio_thresh="$ratio_threshold" '
     NR == 1 {
         prev_ts = $1
         prev_host = $2
         prev_user = $3
         prev_rollovers = $4
         prev_uptime = $5
+        prev_regular = $6
+        prev_warning = $7
+        prev_msg = $8
+        prev_tripwire = $9
         first_ts = $1
         first_user = $3
         next
@@ -697,8 +712,38 @@ analyze_assert_counts() {
     }
     END {
         if (NR == 1) {
-            # Single snapshot - informational only
-            printf "SINGLE|%s|%s|%d|%d|%d\n", prev_ts, prev_host, prev_user, prev_rollovers, prev_uptime
+            # Single snapshot - apply ratio-based heuristic
+            user = prev_user
+            regular = prev_regular
+            warning = prev_warning
+            msg = prev_msg
+            tripwire = prev_tripwire
+            
+            # Find max of other assert types
+            max_other = regular
+            if (warning > max_other) max_other = warning
+            if (msg > max_other) max_other = msg
+            if (tripwire > max_other) max_other = tripwire
+            
+            # Determine if suspicious based on ratio
+            suspicious = 0
+            ratio = 0
+            if (max_other > 0) {
+                ratio = user / max_other
+                if (ratio >= ratio_thresh) {
+                    suspicious = 1
+                }
+            } else if (user > 0) {
+                # All others are zero but user has value - also suspicious
+                suspicious = 1
+                ratio = -1  # Special marker for "infinite" ratio
+            }
+            
+            if (suspicious) {
+                printf "SINGLE_SUSPICIOUS|%s|%s|%d|%d|%d|%d|%d|%d|%d|%.0f\n", prev_ts, prev_host, user, prev_rollovers, prev_uptime, regular, warning, msg, tripwire, ratio
+            } else {
+                printf "SINGLE|%s|%s|%d|%d|%d|%d|%d|%d|%d\n", prev_ts, prev_host, user, prev_rollovers, prev_uptime, regular, warning, msg, tripwire
+            }
         } else {
             printf "SUMMARY|%d|%s|%s|%d|%d\n", NR, first_ts, last_ts, first_user, last_user
             if (spikes > 0) {
@@ -787,7 +832,7 @@ display_combined_results() {
     
     # Parse results
     local log_high=0 log_medium=0 log_suspicious_ips=""
-    local b1_spikes=0 b1_summary=""
+    local b1_spikes=0 b1_summary="" b1_suspicious=false
     local b2_spikes=0 b2_spike_windows=""
     
     # Count log findings
@@ -806,6 +851,7 @@ display_combined_results() {
             case "$type" in
                 SPIKE) ((b1_spikes++)) || true ;;
                 SUMMARY) b1_summary="$rest" ;;
+                SINGLE_SUSPICIOUS) b1_suspicious=true ;;
             esac
         done <<< "$b1_results"
     fi
@@ -822,13 +868,18 @@ display_combined_results() {
     local confidence="INFO"
     local has_log_findings=false
     local has_ftdc_spikes=false
+    local has_b1_suspicious=false
     
     [[ $log_high -gt 0 || $log_medium -gt 0 ]] && has_log_findings=true
     [[ $b2_spikes -gt 0 ]] && has_ftdc_spikes=true
+    [[ "$b1_suspicious" == true ]] && has_b1_suspicious=true
     
     if [[ "$has_log_findings" == true && "$has_ftdc_spikes" == true ]]; then
         confidence="HIGH"
     elif [[ "$has_log_findings" == true || "$has_ftdc_spikes" == true ]]; then
+        confidence="MEDIUM"
+    elif [[ "$has_b1_suspicious" == true ]]; then
+        # Single snapshot with suspicious ratio pattern
         confidence="MEDIUM"
     elif [[ $b1_spikes -gt 0 ]]; then
         confidence="LOW"
@@ -851,6 +902,7 @@ display_combined_results() {
     echo "  Burst Rate Thresh:  ${BURST_RATE_THRESHOLD}/min"
     echo "  Metadata Rate:      ${METADATA_RATE_THRESHOLD}"
     echo "  Spike Threshold:    ${SPIKE_THRESHOLD}"
+    echo "  User Ratio Thresh:  ${USER_RATIO_THRESHOLD}x"
     echo
     
     # Display Module A results (log correlation)
@@ -890,13 +942,34 @@ display_combined_results() {
         while IFS='|' read -r type rest; do
             case "$type" in
                 SINGLE)
-                    IFS='|' read -r ts host user rollovers uptime <<< "$rest"
-                    echo "  Single snapshot (informational only - no baseline for comparison)"
+                    IFS='|' read -r ts host user rollovers uptime regular warning msg tripwire <<< "$rest"
+                    echo "  Single snapshot (no baseline for comparison)"
                     echo "    Timestamp:   $ts"
                     echo "    Hostname:    $host"
-                    echo "    asserts.user: $user"
-                    echo "    rollovers:   $rollovers"
-                    echo "    uptime:      ${uptime}s"
+                    echo "    asserts.user:     $user"
+                    echo "    asserts.regular:  $regular"
+                    echo "    asserts.warning:  $warning"
+                    echo "    asserts.msg:      $msg"
+                    echo "    asserts.tripwire: $tripwire"
+                    echo "    rollovers:        $rollovers"
+                    echo "    uptime:           ${uptime}s"
+                    ;;
+                SINGLE_SUSPICIOUS)
+                    IFS='|' read -r ts host user rollovers uptime regular warning msg tripwire ratio <<< "$rest"
+                    echo -e "  ${RED}⚠ SUSPICIOUS PATTERN DETECTED${RESET}"
+                    echo "    Timestamp:   $ts"
+                    echo "    Hostname:    $host"
+                    echo "    asserts.user:     $user"
+                    echo "    asserts.regular:  $regular"
+                    echo "    asserts.warning:  $warning"
+                    echo "    asserts.msg:      $msg"
+                    echo "    asserts.tripwire: $tripwire"
+                    if [[ "$ratio" == "-1" ]]; then
+                        echo -e "    ${RED}Ratio: user asserts present with ALL other types at zero${RESET}"
+                    else
+                        echo -e "    ${RED}Ratio: user is ${ratio}x higher than max other type (threshold: ${USER_RATIO_THRESHOLD}x)${RESET}"
+                    fi
+                    echo "    This pattern is consistent with MongoBleed exploitation"
                     ;;
                 SUMMARY)
                     IFS='|' read -r count first_ts last_ts first_user last_user <<< "$rest"
@@ -960,6 +1033,9 @@ display_combined_results() {
                 echo "    - FTDC spikes detected but log correlation unavailable/inconclusive"
             elif [[ "$has_log_findings" == true ]]; then
                 echo "    - Suspicious connection patterns but FTDC data unavailable for correlation"
+            elif [[ "$has_b1_suspicious" == true ]]; then
+                echo "    - Suspicious assert ratio: user asserts disproportionately high vs other types"
+                echo "    - Pattern is consistent with MongoBleed exploitation"
             fi
             ;;
         LOW)
@@ -1281,7 +1357,7 @@ main() {
         # Run Module B1 (Assert Counts)
         if [[ "$MODULE_B1_AVAILABLE" == true ]]; then
             info "Module B1: Analyzing assert-counts..."
-            b1_results=$(analyze_assert_counts "$DATA_DIR/assert-counts" "$SPIKE_THRESHOLD")
+            b1_results=$(analyze_assert_counts "$DATA_DIR/assert-counts" "$SPIKE_THRESHOLD" "$USER_RATIO_THRESHOLD")
         fi
         
         # Run Module B2 (FTDC Spikes)

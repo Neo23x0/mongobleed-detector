@@ -27,9 +27,17 @@ from pathlib import Path
 from typing import Optional
 
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 SCRIPT_DIR = Path(__file__).parent
 DETECTOR_SCRIPT = SCRIPT_DIR / "mongobleed-detector.sh"
+
+# Global debug flag
+DEBUG = False
+
+def debug(msg: str):
+    """Print debug message if debugging is enabled."""
+    if DEBUG:
+        print(f"\033[0;36m[DEBUG]\033[0m {msg}", file=sys.stderr)
 
 # Default remote paths
 DEFAULT_LOG_PATHS = [
@@ -254,6 +262,11 @@ Examples:
         help="Suppress progress messages"
     )
     parser.add_argument(
+        "--debug", "-d",
+        action="store_true",
+        help="Enable debug output (show SSH commands and errors)"
+    )
+    parser.add_argument(
         "--version", "-v",
         action="version",
         version=f"%(prog)s {VERSION}"
@@ -367,38 +380,57 @@ def collect_logs(hostname: str, args, host_dir: Path) -> int:
     logs_dir = host_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     
+    debug(f"[{hostname}] Collecting logs from {len(args.log_paths)} path(s)")
+    
     collected = 0
     for log_path in args.log_paths:
         # Check if file exists on remote
         ssh_cmd = build_ssh_command(args, hostname)
         ssh_cmd.append(f"test -f {log_path} && echo exists")
         
-        result = subprocess.run(
-            ssh_cmd,
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
+        debug(f"[{hostname}] Checking: {' '.join(ssh_cmd)}")
         
-        if "exists" in result.stdout:
-            # Copy the file
-            local_name = Path(log_path).name
-            scp_cmd = build_scp_command(
-                args, hostname,
-                log_path,
-                str(logs_dir / local_name)
-            )
-            
-            scp_result = subprocess.run(
-                scp_cmd,
+        try:
+            result = subprocess.run(
+                ssh_cmd,
                 capture_output=True,
                 text=True,
-                timeout=120
+                timeout=30
             )
             
-            if scp_result.returncode == 0:
-                collected += 1
+            debug(f"[{hostname}] Check {log_path}: exit={result.returncode}, stdout='{result.stdout.strip()}'")
+            if result.stderr.strip():
+                debug(f"[{hostname}] stderr: {result.stderr.strip()}")
+            
+            if "exists" in result.stdout:
+                # Copy the file
+                local_name = Path(log_path).name
+                scp_cmd = build_scp_command(
+                    args, hostname,
+                    log_path,
+                    str(logs_dir / local_name)
+                )
+                
+                debug(f"[{hostname}] Copying: {' '.join(scp_cmd)}")
+                
+                scp_result = subprocess.run(
+                    scp_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=120
+                )
+                
+                if scp_result.returncode == 0:
+                    debug(f"[{hostname}] Successfully copied {log_path}")
+                    collected += 1
+                else:
+                    debug(f"[{hostname}] SCP failed: {scp_result.stderr.strip()}")
+        except subprocess.TimeoutExpired:
+            debug(f"[{hostname}] Timeout checking {log_path}")
+        except Exception as e:
+            debug(f"[{hostname}] Error checking {log_path}: {e}")
     
+    debug(f"[{hostname}] Collected {collected} log file(s)")
     return collected
 
 
@@ -406,6 +438,8 @@ def collect_assert_counts(hostname: str, args, host_dir: Path) -> bool:
     """Collect serverStatus().asserts from remote host. Returns success status."""
     asserts_dir = host_dir / "assert-counts"
     asserts_dir.mkdir(parents=True, exist_ok=True)
+    
+    debug(f"[{hostname}] Collecting serverStatus().asserts via mongosh")
     
     # Build mongosh command to get asserts
     mongosh_cmd = """
@@ -420,6 +454,8 @@ def collect_assert_counts(hostname: str, args, host_dir: Path) -> bool:
     ssh_cmd = build_ssh_command(args, hostname)
     ssh_cmd.append(mongosh_cmd.strip())
     
+    debug(f"[{hostname}] Running: {' '.join(ssh_cmd[:5])}... [mongosh command]")
+    
     try:
         result = subprocess.run(
             ssh_cmd,
@@ -428,7 +464,12 @@ def collect_assert_counts(hostname: str, args, host_dir: Path) -> bool:
             timeout=60
         )
         
+        debug(f"[{hostname}] mongosh exit={result.returncode}")
+        if result.stderr.strip():
+            debug(f"[{hostname}] mongosh stderr: {result.stderr.strip()[:200]}")
+        
         if result.returncode == 0 and result.stdout.strip():
+            debug(f"[{hostname}] mongosh stdout: {result.stdout.strip()[:200]}")
             # Validate JSON
             try:
                 data = json.loads(result.stdout.strip())
@@ -438,13 +479,20 @@ def collect_assert_counts(hostname: str, args, host_dir: Path) -> bool:
                     output_file = asserts_dir / f"asserts-{timestamp}.json"
                     with open(output_file, 'w') as f:
                         json.dump(data, f, indent=2)
+                    debug(f"[{hostname}] Saved asserts to {output_file}")
                     return True
-            except json.JSONDecodeError:
-                pass
+                else:
+                    debug(f"[{hostname}] No 'asserts' key in response")
+            except json.JSONDecodeError as e:
+                debug(f"[{hostname}] JSON decode error: {e}")
+        else:
+            debug(f"[{hostname}] mongosh failed or empty output")
+            if result.stdout.strip():
+                debug(f"[{hostname}] stdout: {result.stdout.strip()[:200]}")
     except subprocess.TimeoutExpired:
-        pass
-    except Exception:
-        pass
+        debug(f"[{hostname}] mongosh timeout")
+    except Exception as e:
+        debug(f"[{hostname}] mongosh error: {e}")
     
     return False
 
@@ -454,44 +502,67 @@ def collect_ftdc_files(hostname: str, args, host_dir: Path) -> int:
     ftdc_dir = host_dir / "ftdc-files"
     ftdc_dir.mkdir(parents=True, exist_ok=True)
     
+    debug(f"[{hostname}] Collecting FTDC from {len(args.ftdc_paths)} path(s)")
+    
     collected = 0
     for ftdc_path in args.ftdc_paths:
         # Check if directory exists and has metrics files
         ssh_cmd = build_ssh_command(args, hostname)
-        ssh_cmd.append(f"test -d {ftdc_path} && ls {ftdc_path}/metrics.* 2>/dev/null | head -5")
+        ssh_cmd.append(f"test -d {ftdc_path} && ls {ftdc_path}/metrics.* 2>/dev/null | head -10")
         
-        result = subprocess.run(
-            ssh_cmd,
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
+        debug(f"[{hostname}] Checking FTDC: {' '.join(ssh_cmd)}")
         
-        if result.returncode == 0 and result.stdout.strip():
-            # Copy metrics files (limited to most recent)
-            for remote_file in result.stdout.strip().split('\n'):
-                if remote_file:
-                    local_name = Path(remote_file).name
-                    scp_cmd = build_scp_command(
-                        args, hostname,
-                        remote_file,
-                        str(ftdc_dir / local_name)
-                    )
-                    
-                    scp_result = subprocess.run(
-                        scp_cmd,
-                        capture_output=True,
-                        text=True,
-                        timeout=120
-                    )
-                    
-                    if scp_result.returncode == 0:
-                        collected += 1
+        try:
+            result = subprocess.run(
+                ssh_cmd,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
             
-            # If we found files in this path, don't check other paths
-            if collected > 0:
-                break
+            debug(f"[{hostname}] FTDC check {ftdc_path}: exit={result.returncode}")
+            if result.stderr.strip():
+                debug(f"[{hostname}] stderr: {result.stderr.strip()}")
+            
+            if result.returncode == 0 and result.stdout.strip():
+                files = result.stdout.strip().split('\n')
+                debug(f"[{hostname}] Found {len(files)} FTDC file(s) in {ftdc_path}")
+                
+                # Copy metrics files (limited to most recent)
+                for remote_file in files:
+                    if remote_file:
+                        local_name = Path(remote_file).name
+                        scp_cmd = build_scp_command(
+                            args, hostname,
+                            remote_file,
+                            str(ftdc_dir / local_name)
+                        )
+                        
+                        debug(f"[{hostname}] Copying FTDC: {local_name}")
+                        
+                        scp_result = subprocess.run(
+                            scp_cmd,
+                            capture_output=True,
+                            text=True,
+                            timeout=120
+                        )
+                        
+                        if scp_result.returncode == 0:
+                            collected += 1
+                        else:
+                            debug(f"[{hostname}] FTDC SCP failed: {scp_result.stderr.strip()}")
+                
+                # If we found files in this path, don't check other paths
+                if collected > 0:
+                    break
+            else:
+                debug(f"[{hostname}] No FTDC files in {ftdc_path}")
+        except subprocess.TimeoutExpired:
+            debug(f"[{hostname}] Timeout checking {ftdc_path}")
+        except Exception as e:
+            debug(f"[{hostname}] Error checking {ftdc_path}: {e}")
     
+    debug(f"[{hostname}] Collected {collected} FTDC file(s)")
     return collected
 
 
@@ -499,33 +570,73 @@ def collect_from_host(hostname: str, args, output_dir: Path) -> CollectionResult
     """Collect all data from a single host."""
     result = CollectionResult(hostname=hostname, success=False)
     
+    debug(f"[{hostname}] Starting collection...")
+    debug(f"[{hostname}] skip_logs={args.skip_logs}, skip_asserts={args.skip_asserts}, skip_ftdc={args.skip_ftdc}")
+    
     # Create host-specific directory
     host_dir = output_dir / hostname
     host_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Test SSH connectivity first
+    ssh_test = build_ssh_command(args, hostname)
+    ssh_test.append("echo connected")
+    debug(f"[{hostname}] Testing SSH: {' '.join(ssh_test)}")
+    
+    try:
+        test_result = subprocess.run(
+            ssh_test,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        if test_result.returncode != 0:
+            debug(f"[{hostname}] SSH test failed: exit={test_result.returncode}")
+            debug(f"[{hostname}] stderr: {test_result.stderr.strip()}")
+            result.error = f"SSH connection failed: {test_result.stderr.strip()[:50]}"
+            return result
+        debug(f"[{hostname}] SSH connection successful")
+    except subprocess.TimeoutExpired:
+        result.error = "SSH connection timeout"
+        debug(f"[{hostname}] SSH connection timeout")
+        return result
+    except Exception as e:
+        result.error = f"SSH error: {str(e)[:50]}"
+        debug(f"[{hostname}] SSH error: {e}")
+        return result
     
     try:
         # Collect logs
         if not args.skip_logs:
             result.logs_collected = collect_logs(hostname, args, host_dir)
+        else:
+            debug(f"[{hostname}] Skipping logs (--skip-logs)")
         
         # Collect assert counts
         if not args.skip_asserts:
             result.asserts_collected = collect_assert_counts(hostname, args, host_dir)
+        else:
+            debug(f"[{hostname}] Skipping asserts (--skip-asserts)")
         
         # Collect FTDC files
         if not args.skip_ftdc:
             result.ftdc_collected = collect_ftdc_files(hostname, args, host_dir)
+        else:
+            debug(f"[{hostname}] Skipping FTDC (--skip-ftdc)")
         
         # Mark as success if we collected anything
         if result.logs_collected > 0 or result.asserts_collected or result.ftdc_collected > 0:
             result.success = True
+            debug(f"[{hostname}] Collection successful: logs={result.logs_collected}, asserts={result.asserts_collected}, ftdc={result.ftdc_collected}")
         else:
             result.error = "No data collected"
+            debug(f"[{hostname}] No data collected from any source")
         
     except subprocess.TimeoutExpired:
         result.error = "Connection timeout"
+        debug(f"[{hostname}] Connection timeout")
     except Exception as e:
         result.error = str(e)[:80]
+        debug(f"[{hostname}] Exception: {e}")
     
     return result
 
@@ -626,7 +737,11 @@ def print_collection_summary(results: list[CollectionResult], args):
 
 
 def main():
+    global DEBUG
     args = parse_args()
+    
+    # Set debug flag
+    DEBUG = args.debug
     
     # Load hosts
     hosts = load_hosts(args)
@@ -641,6 +756,11 @@ def main():
         print(f"MongoBleed Remote Collector v{VERSION}")
         print(f"Collecting from {len(hosts)} host(s) with {args.parallel} parallel connections...")
         print()
+    
+    if DEBUG:
+        debug(f"Log paths to check: {args.log_paths}")
+        debug(f"FTDC paths to check: {args.ftdc_paths}")
+        debug(f"SSH user: {args.user}, port: {args.port}")
     
     # Phase 1: Collection
     collection_results = []

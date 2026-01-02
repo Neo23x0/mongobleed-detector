@@ -56,7 +56,12 @@ Analyzes MongoDB JSON logs to detect exploitation patterns:
 
 ### Module B1: Assert Counts
 
-Analyzes snapshots of `db.serverStatus().asserts` to detect unusual spikes in `asserts.user` counters. While cumulative counters can produce false positives, comparing multiple snapshots allows detection of exploitation bursts.
+Analyzes snapshots of `db.serverStatus().asserts` to detect unusual patterns in `asserts.user` counters:
+
+- **Multiple Snapshots**: Compares snapshots over time to detect sudden spikes in user assertions
+- **Single Snapshot Heuristic**: When only one snapshot is available, detects suspicious patterns by comparing `asserts.user` to other assertion types. If user asserts are disproportionately high (ratio ≥250x) or all other types are zero, flags as suspicious (MEDIUM confidence)
+
+**Note**: Cumulative counters can produce false positives. Use in combination with FTDC (Module B2) for best results.
 
 ### Module B2: FTDC Spike Detection
 
@@ -265,6 +270,7 @@ EOF
 | `-b, --burst-threshold` | Burst rate threshold per minute | 400 |
 | `-m, --metadata-rate` | Metadata rate threshold (0.0-1.0) | 0.10 |
 | `--spike-threshold` | Assert spike threshold | 100 |
+| `--user-ratio-threshold` | User/other assert ratio for single snapshot detection | 250 |
 | `--no-default-paths` | Skip default log paths | false |
 | `--forensic-dir <path>` | Analyze subdirectories as separate hosts | - |
 
@@ -320,6 +326,7 @@ Analysis Parameters:
   Burst Rate Thresh:  400/min
   Metadata Rate:      0.10
   Spike Threshold:    100
+  User Ratio Thresh:  250x
 
 Module A - Log Correlation Findings:
 

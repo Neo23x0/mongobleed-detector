@@ -1,6 +1,7 @@
 # Test artifacts
 test/logs/
 test/forensic-evidence/
+collected-data/
 
 # OS files
 .DS_Store
