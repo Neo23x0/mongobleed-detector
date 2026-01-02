@@ -63,6 +63,7 @@ class CollectionResult:
     logs_collected: int = 0
     asserts_collected: bool = False
     ftdc_collected: int = 0
+    ftdc_permission_denied: bool = False
 
 
 @dataclass
@@ -160,6 +161,11 @@ Examples:
         dest="ssh_opts",
         metavar="OPTION",
         help="Additional SSH options (repeatable, e.g., -o 'ProxyJump=bastion')"
+    )
+    ssh_group.add_argument(
+        "--sudo",
+        action="store_true",
+        help="Use sudo for commands that may require elevated privileges (FTDC, logs)"
     )
     
     # Collection options
@@ -380,13 +386,14 @@ def collect_logs(hostname: str, args, host_dir: Path) -> int:
     logs_dir = host_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     
-    debug(f"[{hostname}] Collecting logs from {len(args.log_paths)} path(s)")
+    sudo_prefix = "sudo " if args.sudo else ""
+    debug(f"[{hostname}] Collecting logs from {len(args.log_paths)} path(s) (sudo={args.sudo})")
     
     collected = 0
     for log_path in args.log_paths:
-        # Check if file exists on remote
+        # Check if file exists and is readable on remote
         ssh_cmd = build_ssh_command(args, hostname)
-        ssh_cmd.append(f"test -f {log_path} && echo exists")
+        ssh_cmd.append(f"{sudo_prefix}test -f {log_path} -a -r {log_path} && echo exists")
         
         debug(f"[{hostname}] Checking: {' '.join(ssh_cmd)}")
         
@@ -403,28 +410,52 @@ def collect_logs(hostname: str, args, host_dir: Path) -> int:
                 debug(f"[{hostname}] stderr: {result.stderr.strip()}")
             
             if "exists" in result.stdout:
-                # Copy the file
-                local_name = Path(log_path).name
-                scp_cmd = build_scp_command(
-                    args, hostname,
-                    log_path,
-                    str(logs_dir / local_name)
-                )
-                
-                debug(f"[{hostname}] Copying: {' '.join(scp_cmd)}")
-                
-                scp_result = subprocess.run(
-                    scp_cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=120
-                )
-                
-                if scp_result.returncode == 0:
-                    debug(f"[{hostname}] Successfully copied {log_path}")
-                    collected += 1
+                if args.sudo:
+                    # With sudo, we need to copy via cat to a temp location first
+                    # or use sudo cat and redirect locally
+                    local_file = logs_dir / Path(log_path).name
+                    ssh_cat_cmd = build_ssh_command(args, hostname)
+                    ssh_cat_cmd.append(f"sudo cat {log_path}")
+                    
+                    debug(f"[{hostname}] Copying via sudo cat: {log_path}")
+                    
+                    with open(local_file, 'wb') as f:
+                        cat_result = subprocess.run(
+                            ssh_cat_cmd,
+                            stdout=f,
+                            stderr=subprocess.PIPE,
+                            timeout=120
+                        )
+                    
+                    if cat_result.returncode == 0 and local_file.stat().st_size > 0:
+                        debug(f"[{hostname}] Successfully copied {log_path}")
+                        collected += 1
+                    else:
+                        debug(f"[{hostname}] sudo cat failed: {cat_result.stderr.decode().strip()}")
+                        local_file.unlink(missing_ok=True)
                 else:
-                    debug(f"[{hostname}] SCP failed: {scp_result.stderr.strip()}")
+                    # Direct SCP copy
+                    local_name = Path(log_path).name
+                    scp_cmd = build_scp_command(
+                        args, hostname,
+                        log_path,
+                        str(logs_dir / local_name)
+                    )
+                    
+                    debug(f"[{hostname}] Copying: {' '.join(scp_cmd)}")
+                    
+                    scp_result = subprocess.run(
+                        scp_cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=120
+                    )
+                    
+                    if scp_result.returncode == 0:
+                        debug(f"[{hostname}] Successfully copied {log_path}")
+                        collected += 1
+                    else:
+                        debug(f"[{hostname}] SCP failed: {scp_result.stderr.strip()}")
         except subprocess.TimeoutExpired:
             debug(f"[{hostname}] Timeout checking {log_path}")
         except Exception as e:
@@ -502,13 +533,16 @@ def collect_ftdc_files(hostname: str, args, host_dir: Path) -> int:
     ftdc_dir = host_dir / "ftdc-files"
     ftdc_dir.mkdir(parents=True, exist_ok=True)
     
-    debug(f"[{hostname}] Collecting FTDC from {len(args.ftdc_paths)} path(s)")
+    sudo_prefix = "sudo " if args.sudo else ""
+    debug(f"[{hostname}] Collecting FTDC from {len(args.ftdc_paths)} path(s) (sudo={args.sudo})")
     
     collected = 0
+    permission_denied = False
+    
     for ftdc_path in args.ftdc_paths:
         # Check if directory exists and has metrics files
         ssh_cmd = build_ssh_command(args, hostname)
-        ssh_cmd.append(f"test -d {ftdc_path} && ls {ftdc_path}/metrics.* 2>/dev/null | head -10")
+        ssh_cmd.append(f"{sudo_prefix}test -d {ftdc_path} && {sudo_prefix}ls {ftdc_path}/metrics.* 2>&1 | head -10")
         
         debug(f"[{hostname}] Checking FTDC: {' '.join(ssh_cmd)}")
         
@@ -521,40 +555,77 @@ def collect_ftdc_files(hostname: str, args, host_dir: Path) -> int:
             )
             
             debug(f"[{hostname}] FTDC check {ftdc_path}: exit={result.returncode}")
+            output = result.stdout.strip()
             if result.stderr.strip():
                 debug(f"[{hostname}] stderr: {result.stderr.strip()}")
             
-            if result.returncode == 0 and result.stdout.strip():
-                files = result.stdout.strip().split('\n')
-                debug(f"[{hostname}] Found {len(files)} FTDC file(s) in {ftdc_path}")
+            # Check for permission denied
+            if "Permission denied" in output or "Permission denied" in result.stderr:
+                debug(f"[{hostname}] Permission denied accessing {ftdc_path}")
+                permission_denied = True
+                continue
+            
+            if result.returncode == 0 and output and not output.startswith("ls:"):
+                files = output.split('\n')
+                files = [f for f in files if f and not f.startswith("ls:") and "Permission denied" not in f]
                 
-                # Copy metrics files (limited to most recent)
-                for remote_file in files:
-                    if remote_file:
-                        local_name = Path(remote_file).name
-                        scp_cmd = build_scp_command(
-                            args, hostname,
-                            remote_file,
-                            str(ftdc_dir / local_name)
-                        )
-                        
-                        debug(f"[{hostname}] Copying FTDC: {local_name}")
-                        
-                        scp_result = subprocess.run(
-                            scp_cmd,
-                            capture_output=True,
-                            text=True,
-                            timeout=120
-                        )
-                        
-                        if scp_result.returncode == 0:
-                            collected += 1
-                        else:
-                            debug(f"[{hostname}] FTDC SCP failed: {scp_result.stderr.strip()}")
-                
-                # If we found files in this path, don't check other paths
-                if collected > 0:
-                    break
+                if files:
+                    debug(f"[{hostname}] Found {len(files)} FTDC file(s) in {ftdc_path}")
+                    
+                    # Copy metrics files
+                    for remote_file in files:
+                        if remote_file:
+                            local_name = Path(remote_file).name
+                            local_file = ftdc_dir / local_name
+                            
+                            if args.sudo:
+                                # With sudo, copy via cat
+                                ssh_cat_cmd = build_ssh_command(args, hostname)
+                                ssh_cat_cmd.append(f"sudo cat {remote_file}")
+                                
+                                debug(f"[{hostname}] Copying FTDC via sudo cat: {local_name}")
+                                
+                                with open(local_file, 'wb') as f:
+                                    cat_result = subprocess.run(
+                                        ssh_cat_cmd,
+                                        stdout=f,
+                                        stderr=subprocess.PIPE,
+                                        timeout=120
+                                    )
+                                
+                                if cat_result.returncode == 0 and local_file.stat().st_size > 0:
+                                    collected += 1
+                                else:
+                                    debug(f"[{hostname}] sudo cat failed: {cat_result.stderr.decode().strip()}")
+                                    local_file.unlink(missing_ok=True)
+                            else:
+                                # Direct SCP copy
+                                scp_cmd = build_scp_command(
+                                    args, hostname,
+                                    remote_file,
+                                    str(local_file)
+                                )
+                                
+                                debug(f"[{hostname}] Copying FTDC: {local_name}")
+                                
+                                scp_result = subprocess.run(
+                                    scp_cmd,
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=120
+                                )
+                                
+                                if scp_result.returncode == 0:
+                                    collected += 1
+                                else:
+                                    stderr = scp_result.stderr.strip()
+                                    debug(f"[{hostname}] FTDC SCP failed: {stderr}")
+                                    if "Permission denied" in stderr:
+                                        permission_denied = True
+                    
+                    # If we found files in this path, don't check other paths
+                    if collected > 0:
+                        break
             else:
                 debug(f"[{hostname}] No FTDC files in {ftdc_path}")
         except subprocess.TimeoutExpired:
@@ -562,8 +633,11 @@ def collect_ftdc_files(hostname: str, args, host_dir: Path) -> int:
         except Exception as e:
             debug(f"[{hostname}] Error checking {ftdc_path}: {e}")
     
+    if collected == 0 and permission_denied:
+        debug(f"[{hostname}] FTDC collection failed due to permissions. Try --sudo flag.")
+    
     debug(f"[{hostname}] Collected {collected} FTDC file(s)")
-    return collected
+    return collected, permission_denied
 
 
 def collect_from_host(hostname: str, args, output_dir: Path) -> CollectionResult:
@@ -619,7 +693,7 @@ def collect_from_host(hostname: str, args, output_dir: Path) -> CollectionResult
         
         # Collect FTDC files
         if not args.skip_ftdc:
-            result.ftdc_collected = collect_ftdc_files(hostname, args, host_dir)
+            result.ftdc_collected, result.ftdc_permission_denied = collect_ftdc_files(hostname, args, host_dir)
         else:
             debug(f"[{hostname}] Skipping FTDC (--skip-ftdc)")
         
@@ -723,7 +797,17 @@ def print_collection_summary(results: list[CollectionResult], args):
         print("-" * 60)
         for r in successful:
             asserts_str = "✓" if r.asserts_collected else "−"
-            print(f"{r.hostname:<30} {r.logs_collected:<10} {asserts_str:<10} {r.ftdc_collected:<10}")
+            ftdc_str = str(r.ftdc_collected) if r.ftdc_collected > 0 else ("⚠" if r.ftdc_permission_denied else "−")
+            print(f"{r.hostname:<30} {r.logs_collected:<10} {asserts_str:<10} {ftdc_str:<10}")
+        print()
+    
+    # Show permission warnings
+    ftdc_permission_issues = [r for r in results if r.ftdc_permission_denied and r.ftdc_collected == 0]
+    if ftdc_permission_issues:
+        print("\033[0;33m⚠ FTDC Permission Issues:\033[0m")
+        for r in ftdc_permission_issues:
+            print(f"  {r.hostname}: FTDC files exist but permission denied")
+        print("  \033[0;36mTip: Use --sudo to collect with elevated privileges\033[0m")
         print()
     
     if failed:

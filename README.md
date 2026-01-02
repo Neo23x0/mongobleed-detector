@@ -247,7 +247,15 @@ EOF
 # Pass SSH options (e.g., jump host)
 ./mongobleed-remote.py --hosts-file hosts.txt --user admin \
     -o "ProxyJump=bastion.example.com"
+
+# Use sudo for privileged file access (FTDC files are often restricted)
+./mongobleed-remote.py --hosts-file hosts.txt --user admin --sudo
+
+# Debug mode to troubleshoot connection issues
+./mongobleed-remote.py --hosts-file hosts.txt --user admin --debug
 ```
+
+> **Note on FTDC Permissions**: FTDC files in `/var/lib/mongodb/diagnostic.data/` are typically owned by the `mongodb` user and not readable by regular users. If you see "FTDC Permission Issues" warnings, use the `--sudo` flag. This requires the remote user to have passwordless sudo access (NOPASSWD in sudoers).
 
 ### What Gets Collected
 
@@ -273,6 +281,29 @@ EOF
 | `--user-ratio-threshold` | User/other assert ratio for single snapshot detection | 250 |
 | `--no-default-paths` | Skip default log paths | false |
 | `--forensic-dir <path>` | Analyze subdirectories as separate hosts | - |
+
+### mongobleed-remote.py
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-H, --host <hostname>` | Remote host to scan (repeatable) | - |
+| `-f, --hosts-file <file>` | File containing hostnames (one per line) | - |
+| `-u, --user <user>` | SSH username | Current user |
+| `-k, --key <file>` | SSH private key file | ssh-agent |
+| `-P, --port <port>` | SSH port | 22 |
+| `-o, --ssh-options <opt>` | Additional SSH options (repeatable) | - |
+| `--sudo` | Use sudo for privileged file access (FTDC) | false |
+| `-O, --output-dir <path>` | Directory to store collected data | `./collected-data` |
+| `--log-path <path>` | Remote log path to collect (repeatable) | Standard paths |
+| `--ftdc-path <path>` | Remote FTDC directory path (repeatable) | Standard paths |
+| `--skip-logs` | Skip log collection | false |
+| `--skip-asserts` | Skip serverStatus().asserts collection | false |
+| `--skip-ftdc` | Skip FTDC file collection | false |
+| `--collect-only` | Only collect data, don't run analysis | false |
+| `-j, --parallel <n>` | Number of parallel connections | 5 |
+| `--timeout <seconds>` | SSH command timeout | 300 |
+| `-d, --debug` | Enable debug output (show SSH commands) | false |
+| `-q, --quiet` | Suppress progress messages | false |
 
 ### Exit Codes
 
